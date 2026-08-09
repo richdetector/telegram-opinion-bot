@@ -62,7 +62,7 @@ def verify_news(news):
 
 
 def passes_publish_safety(item):
-    if item.market_impact < 72:
+    if item.market_impact < 65:
         return False
     if item.materiality not in {"HIGH", "CRITICAL"}:
         return False

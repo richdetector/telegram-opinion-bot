@@ -16,9 +16,21 @@ from editor_writer import write_news
 from editor_reviewer import review_report
 
 from auto_publish_engine import should_auto_publish
+from config import DRY_RUN
+from crypto_market_engine import fetch_btc_market_state, market_state_to_news_item
+from diagnostics import (
+    count_market_discards,
+    count_selector_rejections,
+    empty_discard_counter,
+)
+from dry_run_report import (
+    print_btc_market_state,
+    print_dry_run_report,
+    print_funnel_summary,
+)
 from formatter import format_report
-from telegram_bot import publish_message
-from history import was_sent, remember
+from publishing import publish_selected
+from history import was_sent
 from pending import is_pending
 
 
@@ -53,17 +65,33 @@ def _preselect_market_candidates(news):
 async def process_news():
 
     start = time.perf_counter()
+    funnel = {}
+    discard_counters = empty_discard_counter()
 
     acquisition_start = time.perf_counter()
 
     rss_news = get_news(limit_per_feed=RSS_LIMIT_PER_FEED)
     telegram_news = await get_telegram_news(limit=TELEGRAM_LIMIT_PER_CHANNEL)
+    btc_market_state = fetch_btc_market_state() if DRY_RUN else None
+    market_state_news = (
+        [market_state_to_news_item(btc_market_state)]
+        if DRY_RUN
+        else []
+    )
+    market_state_news = [
+        item
+        for item in market_state_news
+        if item is not None
+    ]
     noticias = rss_news + telegram_news
+    noticias.extend(market_state_news)
 
     acquisition_time = time.perf_counter() - acquisition_start
 
     total_rss = len(rss_news)
     total_telegram = len(telegram_news)
+    funnel["rss"] = total_rss
+    funnel["telegram"] = total_telegram
 
     noticias = [
         n
@@ -76,17 +104,30 @@ async def process_news():
 
     noticias = clean_news(noticias)
     total_clean = len(noticias)
+    funnel["after_filter"] = total_clean
 
     classifier_start = time.perf_counter()
     noticias = classify_news(noticias)
     noticias = score_market_news(noticias)
     classifier_time = time.perf_counter() - classifier_start
+    funnel["after_market_scorer"] = len(noticias)
+    discard_counters.update(count_market_discards(noticias))
 
     noticias = _preselect_market_candidates(noticias)
     total_precandidates = len(noticias)
+    funnel["precandidates"] = total_precandidates
 
     if not noticias:
-        print("\n✅ No hay señales con impacto material suficiente.\n")
+        funnel["after_enrichment"] = 0
+        funnel["after_verification"] = 0
+        funnel["after_deduper"] = 0
+        funnel["selected"] = 0
+        funnel["reviewer_pass"] = False
+        funnel["would_publish"] = 0
+        print_funnel_summary(funnel, discard_counters)
+        if DRY_RUN:
+            print_btc_market_state(btc_market_state)
+        print("\nRADAR: NO MATERIAL EVENTS\n")
         return
 
     download_start = time.perf_counter()
@@ -96,9 +137,14 @@ async def process_news():
 
     enricher_start = time.perf_counter()
     noticias = enrich_metadata(noticias)
+    funnel["after_enrichment"] = len(noticias)
     noticias = score_market_news(noticias)
     noticias = verify_news(noticias)
+    funnel["after_verification"] = len(noticias)
+    before_dedupe = len(noticias)
     noticias = dedupe_news(noticias)
+    discard_counters["duplicate"] += max(0, before_dedupe - len(noticias))
+    funnel["after_deduper"] = len(noticias)
     enricher_time = time.perf_counter() - enricher_start
 
     noticias.sort(
@@ -126,19 +172,39 @@ async def process_news():
     print("=======================================================\n")
 
     selector_start = time.perf_counter()
+    selector_input = list(noticias)
     noticias = select_news_with_ai(noticias)
     noticias = noticias[:MAX_PUBLICATIONS]
     selector_time = time.perf_counter() - selector_start
+    funnel["selected"] = len(noticias)
+    discard_counters["selector_rejected"] += count_selector_rejections(
+        selector_input,
+        noticias,
+    )
 
+    before_safety = list(noticias)
     noticias = [
         item
         for item in noticias
         if passes_publish_safety(item)
     ]
+    safety_links = {item.link for item in noticias}
+    for item in before_safety:
+        if item.link not in safety_links:
+            if item.confidence == "Baja":
+                discard_counters["low_confidence"] += 1
+            elif item.source_type == "COMMUNITY":
+                discard_counters["weak_source"] += 1
+            else:
+                discard_counters["low_materiality"] += 1
 
     if not noticias:
-
-        print("\n✅ El selector no encontró acontecimientos publicables.\n")
+        funnel["reviewer_pass"] = False
+        funnel["would_publish"] = 0
+        print_funnel_summary(funnel, discard_counters)
+        if DRY_RUN:
+            print_btc_market_state(btc_market_state)
+        print_dry_run_report([], [])
         return
 
     writer_start = time.perf_counter()
@@ -148,8 +214,12 @@ async def process_news():
     reviewer_start = time.perf_counter()
     revision = review_report(informe, len(noticias))
     reviewer_time = time.perf_counter() - reviewer_start
+    reviewer_pass = bool(revision.get("ok"))
+    funnel["reviewer_pass"] = reviewer_pass
 
     if not should_auto_publish(revision, noticias):
+        discard_counters["reviewer_rejected"] += len(noticias)
+        funnel["would_publish"] = 0
 
         print("\n⛔ Reviewer bloqueó la publicación:\n")
 
@@ -157,27 +227,21 @@ async def process_news():
             print("-", error)
 
         print("\nNo se publica nada en este ciclo.\n")
+        print_funnel_summary(funnel, discard_counters)
+        if DRY_RUN:
+            print_btc_market_state(btc_market_state)
         return
 
     mensajes = format_report(informe)
+    funnel["would_publish"] = len(mensajes)
 
-    auto_published = 0
+    if DRY_RUN:
+        print_funnel_summary(funnel, discard_counters)
+        print_btc_market_state(btc_market_state)
+        print_dry_run_report(noticias, mensajes)
+        return
 
-    for noticia, mensaje in zip(noticias, mensajes):
-
-        await publish_message(mensaje)
-
-        remember(
-            noticia,
-            "published"
-        )
-
-        auto_published += 1
-
-        print(
-            f"🚀 Publicado automáticamente ({noticia.market_impact}/100): "
-            f"{noticia.title}"
-        )
+    auto_published = await publish_selected(noticias, mensajes)
 
     total_time = time.perf_counter() - start
 

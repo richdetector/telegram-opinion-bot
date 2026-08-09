@@ -1,3 +1,6 @@
+import re
+
+
 DOMAINS = {
     "MACRO",
     "MARKETS",
@@ -29,7 +32,7 @@ ASSETS = {
     "GAS": ["gas", "natural gas", "lng"],
     "GOLD": ["gold"],
     "BTC": ["bitcoin", "btc", "spot bitcoin etf"],
-    "ETH": ["ethereum", "ether", "eth", "spot eth etf"],
+    "ETH": ["ethereum", "ether", "spot eth etf", "eth etf"],
 }
 
 SYSTEMIC_COMPANIES = {
@@ -48,6 +51,7 @@ SYSTEMIC_COMPANIES = {
 EVENT_KEYWORDS = {
     "CENTRAL_BANK": [
         "fed",
+        "federal reserve",
         "fomc",
         "ecb",
         "bce",
@@ -79,7 +83,7 @@ EVENT_KEYWORDS = {
         "tga",
         "reverse repo",
         "repo",
-        "credit",
+        "credit crunch",
         "bank lending",
         "financial conditions",
     ],
@@ -178,14 +182,21 @@ def text_blob(item):
     return f"{item.title} {item.summary} {item.content}".lower()
 
 
+def keyword_in_text(keyword, text):
+    if len(keyword) <= 4 and keyword.replace("/", "").isalnum():
+        return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
+
+    return keyword in text
+
+
 def detect_assets(text):
     assets = []
     for asset, keywords in ASSETS.items():
-        if any(keyword in text for keyword in keywords):
+        if any(keyword_in_text(keyword, text) for keyword in keywords):
             assets.append(asset)
 
     for company, keywords in SYSTEMIC_COMPANIES.items():
-        if any(keyword in text for keyword in keywords):
+        if any(keyword_in_text(keyword, text) for keyword in keywords):
             assets.append(company)
 
     return assets
@@ -196,7 +207,7 @@ def detect_event_type(text):
     best_hits = 0
 
     for event_type, keywords in EVENT_KEYWORDS.items():
-        hits = sum(keyword in text for keyword in keywords)
+        hits = sum(keyword_in_text(keyword, text) for keyword in keywords)
         if hits > best_hits:
             best_event = event_type
             best_hits = hits

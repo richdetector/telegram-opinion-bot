@@ -6,6 +6,38 @@ La version actual no inventa datos de mercado. Si una senal no esta disponible e
 
 ## Integraciones necesarias
 
+## Primera integracion implementada
+
+### Binance USD-M Futures public API
+
+- Datos usados ahora: BTCUSDT price, 24h change, quote volume, hourly klines, open interest history, funding history, recent force orders/liquidations.
+- Free tier: endpoints publicos sin API key.
+- Rate limits: Binance aplica limites por IP y devuelve `429` si se exceden; se debe hacer backoff. Los endpoints tienen pesos distintos.
+- API key: no necesaria para esta primera capa.
+- Coste: gratuito.
+- Calidad del dato: alta para BTCUSDT en Binance, pero representa una sede/exchange, no todo el mercado global.
+- Fiabilidad: buena para precio/futuros de Binance; incompleta como proxy agregado de mercado institucional.
+- Limitacion clave: liquidations y OI son Binance-centric; no sustituyen datos agregados multi-exchange.
+
+### Opciones investigadas
+
+#### CoinGlass
+
+- Datos: derivados, options, ETF flows, on-chain, liquidity maps, order book, whale/large position metrics.
+- Free tier/API key: requiere cuenta/API key para API V4; muchas metricas avanzadas dependen del plan.
+- Coste: producto profesional; documentacion publica menciona planes de pago.
+- Calidad: muy buena para datos agregados de derivados/liquidez, mas completa que un exchange aislado.
+- Decision: no se integra aun para evitar activar dependencia de pago/API key en esta fase.
+
+#### CoinGecko
+
+- Datos: precio, volumen, market data agregado, exchanges, derivatives coverage segun plan.
+- Free tier: demo/keyless o demo plan; rate limits y creditos mensuales limitados.
+- API key: opcional/segun plan.
+- Coste: free demo; planes de pago para mas capacidad/frescura.
+- Calidad: buena para spot/market data agregado; menos directo para OI/funding/liquidations.
+- Decision: no se integra aun porque Binance cubre mejor la primera capa BTC derivatives sin clave.
+
 ### Precio y volumen
 
 - Fuente ideal: exchange APIs liquidas o proveedor agregado.

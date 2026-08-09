@@ -19,9 +19,31 @@ CHANNEL_CHAT_ID = os.getenv("CHANNEL_CHAT_ID")
 
 # Telegram Client (Telethon)
 
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
+TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID") or 0)
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 
 # OpenAI
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Optional market data providers
+BLOCKWORKS_API_KEY = os.getenv("BLOCKWORKS_API_KEY")
+
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+# Safe default: never publish unless explicitly disabled.
+DRY_RUN = _env_bool("DRY_RUN", default=True)

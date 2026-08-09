@@ -7,6 +7,7 @@ SOURCE_TYPES = {
 }
 
 SOURCE_REGISTRY = {
+    "MARKET_STATE": {"type": "PRIMARY", "reliability": 70, "speed": 80},
     "Federal Reserve - Monetary Policy": {"type": "PRIMARY", "reliability": 98, "speed": 80},
     "Federal Reserve - All Press Releases": {"type": "PRIMARY", "reliability": 98, "speed": 75},
     "Federal Reserve - Balance Sheet": {"type": "PRIMARY", "reliability": 98, "speed": 65},

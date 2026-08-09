@@ -8,7 +8,7 @@ from verification import passes_publish_safety
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "market_selector.md"
 
-MIN_MARKET_IMPACT = 72
+MIN_MARKET_IMPACT = 65
 MAX_SELECTED = 2
 
 

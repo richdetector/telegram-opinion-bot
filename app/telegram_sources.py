@@ -2,10 +2,8 @@ CHANNELS = [
     "ClashReport",
     "OSINTdefender",
     "Faytuks",
-    "OpenAI",
     "AnthropicAI",
     "NVIDIAAI",
-    "FinancialTimes",
     "Bloomberg",
 ]
 
