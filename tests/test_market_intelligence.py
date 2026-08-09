@@ -18,11 +18,16 @@ from crypto_market_engine import (
 from deduper import dedupe_news
 from dry_run_report import print_dry_run_report
 from editor_selector import select_news_with_ai
+from liquidity_structure_engine import (
+    BtcLiquidityStructureSnapshot,
+    LiquidityCluster,
+)
 from market_scorer import score_market_item
 from market_data import BtcEtfFlowSnapshot, BtcMarketSnapshot
 from market_data import BtcOnchainSnapshot, LargeBtcTransfer, classify_large_transfer
 from models import NewsItem
 from publishing import DryRunPublishBlocked
+from sentiment_engine import BtcSentimentSnapshot
 
 
 def item(title, summary="", source="CNBC"):
@@ -786,6 +791,393 @@ class MarketIntelligenceTests(unittest.TestCase):
 
         self.assertNotIn("institutions are buying", text)
         self.assertNotIn("las instituciones están comprando", text)
+
+    def test_retail_bullish_isolated_no_event(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            BtcSentimentSnapshot(retail_sentiment="BULLISH", retail_sentiment_score=65),
+        )
+
+        self.assertIn("RETAIL_BULLISH", [signal.name for signal in state.signals])
+        self.assertEqual(state.confluence, "LOW")
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_retail_euphoria_funding_extreme_oi_extreme_is_crowding_relevant(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=12.0,
+                funding_rate=0.0015,
+                funding_extreme="POSITIVE",
+            ),
+            None,
+            None,
+            BtcSentimentSnapshot(retail_sentiment="EUPHORIA", retail_sentiment_score=92),
+        )
+
+        names = [signal.name for signal in state.signals]
+        self.assertIn("CROWDED_LONG", names)
+        self.assertIn("CROWDING_RISK_CONFLUENCE", names)
+        self.assertEqual(state.confluence, "HIGH")
+
+    def test_retail_bearish_etf_inflows_exchange_outflows_positive_divergence(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(funding_rate=0.0001, funding_extreme="NORMAL"),
+            BtcEtfFlowSnapshot(
+                btc_etf_net_flow=700_000_000,
+                btc_etf_flow_zscore=2.8,
+                btc_etf_flow_streak=1,
+                btc_etf_flow_regime="NEUTRAL",
+            ),
+            BtcOnchainSnapshot(
+                btc_exchange_outflow=7000,
+                btc_exchange_outflow_zscore=3.2,
+                btc_exchange_reserve_change_1d=-0.8,
+                btc_exchange_reserve_change_7d=-1.4,
+            ),
+            BtcSentimentSnapshot(retail_sentiment="BEARISH", retail_sentiment_score=30),
+        )
+
+        names = [signal.name for signal in state.signals]
+        self.assertIn("POSITIVE_FLOW_NEGATIVE_RETAIL_DIVERGENCE", names)
+        self.assertIn("SENTIMENT_FLOW_DIVERGENCE_CONFLUENCE", names)
+        self.assertEqual(state.confluence, "HIGH")
+
+    def test_social_attention_spike_alone_is_not_high(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            BtcSentimentSnapshot(
+                retail_attention="SPIKE",
+                retail_attention_score=90,
+            ),
+        )
+
+        self.assertIn("RETAIL_ATTENTION_SPIKE", [signal.name for signal in state.signals])
+        self.assertNotEqual(state.confluence, "HIGH")
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_sentiment_api_unavailable_keeps_radar_alive(self):
+        def failing_sentiment_fetcher():
+            raise RuntimeError("sentiment down")
+
+        state = fetch_btc_market_state(
+            fetcher=lambda: BtcMarketSnapshot(),
+            etf_fetcher=lambda: BtcEtfFlowSnapshot(),
+            onchain_fetcher=lambda: BtcOnchainSnapshot(),
+            sentiment_fetcher=failing_sentiment_fetcher,
+        )
+
+        self.assertIn("sentiment:RuntimeError", state.sentiment.errors)
+        self.assertEqual(state.confluence, "LOW")
+
+    def test_unknown_sentiment_does_not_invent(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            BtcSentimentSnapshot(errors=["sentiment:NO_DATA"]),
+        )
+
+        self.assertEqual(state.sentiment.retail_sentiment, "UNKNOWN")
+        self.assertEqual(state.sentiment.crowding_state, "UNKNOWN")
+        self.assertNotIn("CROWDED_LONG", [signal.name for signal in state.signals])
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_crowding_long_does_not_produce_sell_signal(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=12.0,
+                funding_rate=0.0015,
+                funding_extreme="POSITIVE",
+            ),
+            None,
+            None,
+            BtcSentimentSnapshot(retail_sentiment="EUPHORIA", retail_sentiment_score=92),
+        )
+        event = market_state_to_news_item(state)
+        text = f"{state.summary} {event.title} {event.summary} {event.content}".lower()
+
+        self.assertNotIn("sell", text)
+        self.assertNotIn("vende", text)
+
+    def test_crowding_short_does_not_produce_buy_signal(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=12.0,
+                funding_rate=-0.0015,
+                funding_extreme="NEGATIVE",
+            ),
+            None,
+            None,
+            BtcSentimentSnapshot(retail_sentiment="PANIC", retail_sentiment_score=8),
+        )
+        event = market_state_to_news_item(state)
+        text = f"{state.summary} {event.title} {event.summary} {event.content}".lower()
+
+        self.assertNotIn("buy", text)
+        self.assertNotIn("compra", text)
+
+    def test_institutional_proxy_is_never_claimed_as_certainty_without_direct_evidence(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            BtcEtfFlowSnapshot(
+                btc_etf_net_flow=700_000_000,
+                btc_etf_flow_zscore=2.8,
+            ),
+            BtcOnchainSnapshot(
+                btc_exchange_outflow=7000,
+                btc_exchange_outflow_zscore=3.2,
+            ),
+            BtcSentimentSnapshot(retail_sentiment="BEARISH", retail_sentiment_score=30),
+        )
+        text = f"{state.sentiment.institutional_flow_proxy} {state.summary} "
+        text += " ".join(signal.evidence for signal in state.signals)
+        text = text.lower()
+
+        self.assertNotIn("institutions are buying", text)
+        self.assertNotIn("las instituciones están comprando", text)
+        self.assertEqual(
+            state.sentiment.institutional_flow_proxy,
+            "INSTITUTIONAL_DEMAND_POSITIVE",
+        )
+        self.assertTrue("proxy" in text or "proxies" in text)
+
+    def test_sentiment_derivatives_and_flows_increase_confluence(self):
+        base = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=12.0,
+                funding_rate=0.0015,
+                funding_extreme="POSITIVE",
+            )
+        )
+        with_sentiment_flows = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=12.0,
+                funding_rate=0.0015,
+                funding_extreme="POSITIVE",
+            ),
+            BtcEtfFlowSnapshot(
+                btc_etf_net_flow=-650_000_000,
+                btc_etf_flow_zscore=-2.5,
+            ),
+            BtcOnchainSnapshot(
+                btc_exchange_inflow=6000,
+                btc_exchange_inflow_zscore=3.1,
+                btc_exchange_reserve_change_1d=0.8,
+                btc_exchange_reserve_change_7d=1.6,
+            ),
+            BtcSentimentSnapshot(retail_sentiment="EUPHORIA", retail_sentiment_score=92),
+        )
+
+        self.assertGreater(with_sentiment_flows.confluence_score, base.confluence_score)
+        self.assertIn(
+            "NEGATIVE_FLOW_POSITIVE_RETAIL_DIVERGENCE",
+            [signal.name for signal in with_sentiment_flows.signals],
+        )
+
+    def test_liquidity_book_normal_no_event(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            None,
+            BtcLiquidityStructureSnapshot(
+                best_bid=99990,
+                best_ask=100010,
+                spread=20,
+                bid_depth_1pct=100_000_000,
+                ask_depth_1pct=105_000_000,
+                bid_depth_2pct=180_000_000,
+                ask_depth_2pct=185_000_000,
+                book_imbalance=-0.02,
+                structure="RANGE",
+            ),
+        )
+
+        self.assertEqual(state.confluence, "LOW")
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_bid_depth_slightly_greater_is_not_high(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            None,
+            BtcLiquidityStructureSnapshot(
+                bid_depth_1pct=130_000_000,
+                ask_depth_1pct=100_000_000,
+                bid_depth_2pct=220_000_000,
+                ask_depth_2pct=190_000_000,
+                book_imbalance=0.13,
+            ),
+        )
+
+        self.assertNotIn("BID_LIQUIDITY_EXTREME", [signal.name for signal in state.signals])
+        self.assertEqual(state.confluence, "LOW")
+
+    def test_extreme_ask_concentration_generates_liquidity_signal(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            None,
+            BtcLiquidityStructureSnapshot(
+                bid_depth_1pct=100_000_000,
+                ask_depth_1pct=320_000_000,
+                bid_depth_2pct=180_000_000,
+                ask_depth_2pct=500_000_000,
+                book_imbalance=-0.52,
+                largest_ask_cluster=LiquidityCluster(
+                    price=101000,
+                    notional=80_000_000,
+                    distance_pct=1.0,
+                ),
+            ),
+        )
+
+        names = [signal.name for signal in state.signals]
+        self.assertIn("ASK_LIQUIDITY_EXTREME", names)
+        self.assertIn("ORDERBOOK_IMBALANCE_ASK", names)
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_clean_breakout_with_volume_is_structure_signal_not_publication(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            None,
+            BtcLiquidityStructureSnapshot(
+                structure="BULLISH",
+                breakout_state="BREAKOUT_UP",
+                smc_signals=[
+                    "BULLISH_BREAK_OF_STRUCTURE",
+                    "DISPLACEMENT_UP",
+                ],
+            ),
+        )
+
+        names = [signal.name for signal in state.signals]
+        self.assertIn("BULLISH_BREAK_OF_STRUCTURE", names)
+        self.assertIn("DISPLACEMENT_UP", names)
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_failed_breakout_crowded_long_funding_extreme_increases_confluence(self):
+        with_structure = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=12.0,
+                funding_rate=0.0015,
+                funding_extreme="POSITIVE",
+            ),
+            None,
+            None,
+            BtcSentimentSnapshot(retail_sentiment="EUPHORIA", retail_sentiment_score=92),
+            BtcLiquidityStructureSnapshot(
+                breakout_state="FAILED_BREAKOUT_UP",
+                liquidity_sweep="ABOVE",
+                bid_depth_2pct=80_000_000,
+                ask_depth_2pct=400_000_000,
+                smc_signals=[
+                    "FAILED_BREAKOUT",
+                    "LIQUIDITY_SWEEP_ABOVE",
+                ],
+            ),
+        )
+
+        self.assertIn(
+            "STRUCTURE_CROWDING_RISK_CONFLUENCE",
+            [signal.name for signal in with_structure.signals],
+        )
+        self.assertEqual(with_structure.confluence, "HIGH")
+
+    def test_liquidity_sweep_isolated_is_not_high(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            None,
+            BtcLiquidityStructureSnapshot(
+                liquidity_sweep="ABOVE",
+                smc_signals=["LIQUIDITY_SWEEP_ABOVE"],
+            ),
+        )
+
+        self.assertIn("LIQUIDITY_SWEEP_ABOVE", [signal.name for signal in state.signals])
+        self.assertNotEqual(state.confluence, "HIGH")
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_smc_signal_isolated_never_final_event(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            None,
+            BtcLiquidityStructureSnapshot(smc_signals=["FVG_ABOVE"]),
+        )
+
+        self.assertIn("FVG_ABOVE", [signal.name for signal in state.signals])
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_liquidity_api_unavailable_keeps_radar_alive(self):
+        def failing_liquidity_fetcher():
+            raise RuntimeError("order book down")
+
+        state = fetch_btc_market_state(
+            fetcher=lambda: BtcMarketSnapshot(),
+            etf_fetcher=lambda: BtcEtfFlowSnapshot(),
+            onchain_fetcher=lambda: BtcOnchainSnapshot(),
+            sentiment_fetcher=lambda: BtcSentimentSnapshot(),
+            liquidity_fetcher=failing_liquidity_fetcher,
+        )
+
+        self.assertIn("liquidity_structure:RuntimeError", state.liquidity_structure.errors)
+        self.assertEqual(state.confluence, "LOW")
+
+    def test_liquidity_structure_never_produces_buy_sell_language(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=12.0,
+                funding_rate=0.0015,
+                funding_extreme="POSITIVE",
+            ),
+            None,
+            None,
+            BtcSentimentSnapshot(retail_sentiment="EUPHORIA", retail_sentiment_score=92),
+            BtcLiquidityStructureSnapshot(
+                breakout_state="FAILED_BREAKOUT_UP",
+                liquidity_sweep="ABOVE",
+                smc_signals=[
+                    "FAILED_BREAKOUT",
+                    "LIQUIDITY_SWEEP_ABOVE",
+                ],
+            ),
+        )
+        event = market_state_to_news_item(state)
+        text = f"{state.summary} {event.title} {event.summary} {event.content}".lower()
+
+        self.assertNotIn("buy", text)
+        self.assertNotIn("sell", text)
+        self.assertNotIn("compra", text)
+        self.assertNotIn("vende", text)
+
+    def test_liquidity_structure_never_claims_institutions_are_manipulating(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            None,
+            BtcLiquidityStructureSnapshot(
+                liquidity_sweep="ABOVE",
+                smc_signals=["LIQUIDITY_SWEEP_ABOVE", "FAILED_BREAKOUT"],
+            ),
+        )
+        text = " ".join(signal.evidence for signal in state.signals).lower()
+
+        self.assertNotIn("institutions are manipulating", text)
+        self.assertNotIn("smart money hunted stops", text)
+        self.assertNotIn("manipulacion institucional", text)
 
 
 if __name__ == "__main__":

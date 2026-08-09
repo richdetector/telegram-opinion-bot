@@ -8,7 +8,17 @@ from market_data import (
     fetch_btc_market_snapshot,
     fetch_btc_onchain_snapshot,
 )
+from liquidity_structure_engine import (
+    BtcLiquidityStructureSnapshot,
+    analyze_liquidity_structure,
+    fetch_btc_liquidity_structure_snapshot,
+)
 from models import NewsItem
+from sentiment_engine import (
+    BtcSentimentSnapshot,
+    analyze_sentiment_positioning,
+    fetch_btc_sentiment_snapshot,
+)
 
 
 @dataclass
@@ -17,6 +27,8 @@ class MarketSignal:
     strength: int
     certainty: str
     evidence: str
+    timestamp: str = ""
+    source: str = ""
 
 
 @dataclass
@@ -24,6 +36,8 @@ class BtcMarketState:
     snapshot: BtcMarketSnapshot
     etf_flows: BtcEtfFlowSnapshot | None = None
     onchain: BtcOnchainSnapshot | None = None
+    sentiment: BtcSentimentSnapshot | None = None
+    liquidity_structure: BtcLiquidityStructureSnapshot | None = None
     signals: list[MarketSignal] = field(default_factory=list)
     confluence: str = "LOW"
     confluence_score: int = 0
@@ -32,13 +46,15 @@ class BtcMarketState:
     summary: str = "NO MATERIAL BTC MARKET ANOMALY"
 
 
-def _add_signal(signals, name, strength, certainty, evidence):
+def _add_signal(signals, name, strength, certainty, evidence, timestamp="", source=""):
     signals.append(
         MarketSignal(
             name=name,
             strength=max(0, min(100, int(strength))),
             certainty=certainty,
             evidence=evidence,
+            timestamp=timestamp,
+            source=source,
         )
     )
 
@@ -226,7 +242,52 @@ def _onchain_regime(signal_names):
     return "UNKNOWN"
 
 
-def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None):
+def _analyze_sentiment_signals(sentiment, snapshot, etf_flows, onchain):
+    if sentiment is None:
+        return None, []
+
+    sentiment, sentiment_signals = analyze_sentiment_positioning(
+        sentiment,
+        snapshot,
+        etf_flows,
+        onchain,
+    )
+
+    signals = []
+    for signal in sentiment_signals:
+        _add_signal(
+            signals,
+            signal.name,
+            signal.strength,
+            signal.certainty,
+            signal.evidence,
+            signal.timestamp,
+            signal.source,
+        )
+
+    return sentiment, signals
+
+
+def _analyze_liquidity_structure_signals(liquidity_structure):
+    if liquidity_structure is None:
+        return []
+
+    signals = []
+    for signal in analyze_liquidity_structure(liquidity_structure):
+        _add_signal(
+            signals,
+            signal.name,
+            signal.strength,
+            signal.certainty,
+            signal.evidence,
+            signal.timestamp,
+            signal.source,
+        )
+
+    return signals
+
+
+def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None, sentiment=None, liquidity_structure=None):
     signals = []
 
     if snapshot.open_interest_change is not None:
@@ -318,6 +379,15 @@ def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None):
     signals.extend(etf_signals)
     onchain_signals = _analyze_onchain_signals(onchain)
     signals.extend(onchain_signals)
+    sentiment, sentiment_signals = _analyze_sentiment_signals(
+        sentiment,
+        snapshot,
+        etf_flows,
+        onchain,
+    )
+    signals.extend(sentiment_signals)
+    liquidity_structure_signals = _analyze_liquidity_structure_signals(liquidity_structure)
+    signals.extend(liquidity_structure_signals)
     signal_names = {signal.name for signal in signals}
 
     if {"OI_RISING_FAST", "FUNDING_EXTREME_POSITIVE", "VOLUME_SPIKE"} <= signal_names:
@@ -379,6 +449,89 @@ def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None):
         )
 
     if (
+        {"CROWDED_LONG", "OI_RISING_FAST", "FUNDING_EXTREME_POSITIVE"} <= signal_names
+        or {"CROWDED_SHORT", "OI_RISING_FAST", "FUNDING_EXTREME_NEGATIVE"} <= signal_names
+    ):
+        _add_signal(
+            signals,
+            "CROWDING_RISK_CONFLUENCE",
+            78,
+            "INFERRED",
+            "Retail sentiment and derivatives point to crowded positioning; this is context, not a trading signal.",
+        )
+
+    if (
+        "POSITIVE_FLOW_NEGATIVE_RETAIL_DIVERGENCE" in signal_names
+        and (
+            "ETF_INFLOW_STRONG" in signal_names
+            or "ETF_INFLOW_EXTREME" in signal_names
+            or "EXCHANGE_OUTFLOW_EXTREME" in signal_names
+            or "EXCHANGE_RESERVES_FALLING" in signal_names
+        )
+    ):
+        _add_signal(
+            signals,
+            "SENTIMENT_FLOW_DIVERGENCE_CONFLUENCE",
+            80,
+            "INFERRED",
+            "Negative retail sentiment diverges from stronger ETF/on-chain flow proxies.",
+        )
+
+    if (
+        "NEGATIVE_FLOW_POSITIVE_RETAIL_DIVERGENCE" in signal_names
+        and (
+            "ETF_OUTFLOW_STRONG" in signal_names
+            or "ETF_OUTFLOW_EXTREME" in signal_names
+            or "EXCHANGE_INFLOW_EXTREME" in signal_names
+            or "EXCHANGE_RESERVES_RISING" in signal_names
+        )
+    ):
+        _add_signal(
+            signals,
+            "SENTIMENT_DISTRIBUTION_RISK_CONFLUENCE",
+            80,
+            "INFERRED",
+            "Positive retail sentiment diverges from weaker ETF/on-chain flow proxies.",
+        )
+
+    if (
+        {"CROWDED_LONG", "FUNDING_EXTREME_POSITIVE"} <= signal_names
+        and (
+            "LIQUIDITY_VACUUM_BELOW" in signal_names
+            or "FAILED_BREAKOUT" in signal_names
+            or "LIQUIDITY_SWEEP_ABOVE" in signal_names
+        )
+    ):
+        _add_signal(
+            signals,
+            "STRUCTURE_CROWDING_RISK_CONFLUENCE",
+            78,
+            "INFERRED",
+            "Crowded long positioning aligns with weaker structure/liquidity context; this is risk context, not a price forecast.",
+        )
+
+    if (
+        (
+            "ETF_INFLOW_STRONG" in signal_names
+            or "ETF_INFLOW_EXTREME" in signal_names
+            or "CUSTODY_SUPPLY_CONFLUENCE" in signal_names
+        )
+        and (
+            "BULLISH_BREAK_OF_STRUCTURE" in signal_names
+            or "BID_LIQUIDITY_EXTREME" in signal_names
+            or "ORDERBOOK_IMBALANCE_BID" in signal_names
+        )
+        and "FUNDING_EXTREME_POSITIVE" not in signal_names
+    ):
+        _add_signal(
+            signals,
+            "CONSTRUCTIVE_STRUCTURE_FLOW_CONFLUENCE",
+            76,
+            "INFERRED",
+            "Positive flow proxies align with supportive book/structure context without implying a directional trading signal.",
+        )
+
+    if (
         "OI_FALLING_FAST" in signal_names
         and "VOLATILITY_EXPANSION" in signal_names
         and (
@@ -423,6 +576,26 @@ def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None):
         confluence = "HIGH"
         regime = "DISTRIBUTION_RISK"
         summary = "BTC on-chain exchange inflows and positioning show elevated distribution-risk confluence."
+    elif "CROWDING_RISK_CONFLUENCE" in signal_names:
+        confluence = "HIGH"
+        regime = "CROWDED_POSITIONING"
+        summary = "BTC sentiment and derivatives show crowded positioning risk; Radar does not infer direction deterministically."
+    elif "SENTIMENT_FLOW_DIVERGENCE_CONFLUENCE" in signal_names:
+        confluence = "HIGH"
+        regime = "FLOW_SENTIMENT_DIVERGENCE"
+        summary = "BTC flow proxies strengthen while retail sentiment is negative; this is a divergence, not a price signal."
+    elif "SENTIMENT_DISTRIBUTION_RISK_CONFLUENCE" in signal_names:
+        confluence = "HIGH"
+        regime = "DISTRIBUTION_RISK"
+        summary = "BTC retail optimism diverges from weaker flow proxies, raising crowding/distribution-risk context."
+    elif "STRUCTURE_CROWDING_RISK_CONFLUENCE" in signal_names:
+        confluence = "HIGH"
+        regime = "STRUCTURE_CROWDING_RISK"
+        summary = "BTC crowded positioning aligns with weaker liquidity/structure context; Radar treats this as risk context only."
+    elif "CONSTRUCTIVE_STRUCTURE_FLOW_CONFLUENCE" in signal_names:
+        confluence = "HIGH"
+        regime = "CONSTRUCTIVE_FLOW_STRUCTURE"
+        summary = "BTC flow proxies and market structure are constructively aligned without producing a trading recommendation."
     elif confluence_score >= 45 and len(signals) >= 2:
         confluence = "MEDIUM"
         regime = "HIGH_VOLATILITY"
@@ -436,6 +609,8 @@ def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None):
         snapshot=snapshot,
         etf_flows=etf_flows,
         onchain=onchain,
+        sentiment=sentiment,
+        liquidity_structure=liquidity_structure,
         signals=signals,
         confluence=confluence,
         confluence_score=confluence_score,
@@ -456,6 +631,14 @@ def market_state_to_news_item(state):
         title = "BTC derivatives show deleveraging stress"
     elif "LEVERAGE_BUILDUP" in signal_names:
         title = "BTC leverage buildup raises deleveraging risk"
+    elif "CROWDING_RISK_CONFLUENCE" in signal_names:
+        title = "BTC positioning shows crowding risk"
+    elif "SENTIMENT_FLOW_DIVERGENCE_CONFLUENCE" in signal_names:
+        title = "BTC flows diverge from retail sentiment"
+    elif "STRUCTURE_CROWDING_RISK_CONFLUENCE" in signal_names:
+        title = "BTC liquidity and crowding risk align"
+    elif "CONSTRUCTIVE_STRUCTURE_FLOW_CONFLUENCE" in signal_names:
+        title = "BTC flows and structure show confluence"
 
     content = "\n".join(
         [
@@ -498,6 +681,8 @@ def fetch_btc_market_state(
     fetcher=fetch_btc_market_snapshot,
     etf_fetcher=fetch_btc_etf_flow_snapshot,
     onchain_fetcher=fetch_btc_onchain_snapshot,
+    sentiment_fetcher=fetch_btc_sentiment_snapshot,
+    liquidity_fetcher=fetch_btc_liquidity_structure_snapshot,
 ):
     try:
         snapshot = fetcher()
@@ -520,4 +705,24 @@ def fetch_btc_market_state(
             errors=[f"onchain:{type(exc).__name__}"]
         )
 
-    return analyze_btc_market_state(snapshot, etf_flows, onchain)
+    try:
+        sentiment = sentiment_fetcher()
+    except Exception as exc:
+        sentiment = BtcSentimentSnapshot(
+            errors=[f"sentiment:{type(exc).__name__}"]
+        )
+
+    try:
+        liquidity_structure = liquidity_fetcher()
+    except Exception as exc:
+        liquidity_structure = BtcLiquidityStructureSnapshot(
+            errors=[f"liquidity_structure:{type(exc).__name__}"]
+        )
+
+    return analyze_btc_market_state(
+        snapshot,
+        etf_flows,
+        onchain,
+        sentiment,
+        liquidity_structure,
+    )

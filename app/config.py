@@ -29,6 +29,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Optional market data providers
 BLOCKWORKS_API_KEY = os.getenv("BLOCKWORKS_API_KEY")
 GLASSNODE_API_KEY = os.getenv("GLASSNODE_API_KEY")
+SANTIMENT_API_KEY = os.getenv("SANTIMENT_API_KEY")
 
 
 def _env_bool(name, default=False):

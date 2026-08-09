@@ -129,6 +129,143 @@ def print_btc_market_state(state):
         print(f"Whale activity:    {onchain.btc_whale_activity}")
 
     print(f"On-chain regime: {state.onchain_regime}")
+
+    print()
+    print("SENTIMENT / POSITIONING")
+    sentiment = state.sentiment
+    if sentiment is None or (
+        sentiment.retail_sentiment == "UNKNOWN"
+        and sentiment.retail_attention == "UNKNOWN"
+        and sentiment.market_sentiment == "UNKNOWN"
+        and sentiment.crowding_state == "UNKNOWN"
+        and sentiment.positioning_bias == "UNKNOWN"
+        and sentiment.institutional_flow_proxy == "UNKNOWN"
+        and sentiment.narrative_state == "UNKNOWN"
+        and sentiment.sentiment_divergence == "UNKNOWN"
+    ):
+        print("SENTIMENT: UNKNOWN")
+        if sentiment and sentiment.errors:
+            print(f"Sentiment errors: {_list_text(sentiment.errors)}")
+    else:
+        print(f"Retail:              {sentiment.retail_sentiment}")
+        print(f"Market:              {sentiment.market_sentiment}")
+        print(f"Positioning:         {sentiment.positioning_bias}")
+        print(f"Crowding:            {sentiment.crowding_state}")
+        print(f"Institutional proxy: {sentiment.institutional_flow_proxy}")
+        print(f"Narrative:           {sentiment.narrative_state}")
+        print(f"Divergence:          {sentiment.sentiment_divergence}")
+
+    sentiment_signal_names = {
+        "RETAIL_BULLISH",
+        "RETAIL_BEARISH",
+        "RETAIL_EUPHORIA",
+        "RETAIL_PANIC",
+        "RETAIL_ATTENTION_SPIKE",
+        "CROWDED_LONG",
+        "CROWDED_SHORT",
+        "POSITIVE_FLOW_NEGATIVE_RETAIL_DIVERGENCE",
+        "NEGATIVE_FLOW_POSITIVE_RETAIL_DIVERGENCE",
+        "NARRATIVE_OVERHEAT",
+        "COMPLACENCY",
+        "CAPITULATION",
+        "CROWDING_CONFLUENCE",
+        "CROWDING_RISK_CONFLUENCE",
+        "SENTIMENT_FLOW_DIVERGENCE_CONFLUENCE",
+        "SENTIMENT_DISTRIBUTION_RISK_CONFLUENCE",
+    }
+    sentiment_signals = [
+        signal
+        for signal in state.signals
+        if signal.name in sentiment_signal_names
+    ]
+    print("Sentiment signals:")
+    if sentiment_signals:
+        for signal in sentiment_signals:
+            print(
+                f"- {signal.name} "
+                f"strength={signal.strength} "
+                f"certainty={signal.certainty} "
+                f"evidence={signal.evidence}"
+            )
+    else:
+        print("None")
+
+    print()
+    print("LIQUIDITY / STRUCTURE")
+    liquidity = state.liquidity_structure
+    if liquidity is None or (
+        liquidity.best_bid is None
+        and liquidity.best_ask is None
+        and liquidity.book_imbalance is None
+        and liquidity.structure == "UNKNOWN"
+        and liquidity.breakout_state == "UNKNOWN"
+        and liquidity.liquidity_sweep == "UNKNOWN"
+        and not liquidity.smc_signals
+    ):
+        print("LIQUIDITY / STRUCTURE: UNKNOWN")
+        if liquidity and liquidity.errors:
+            print(f"Liquidity errors: {_list_text(liquidity.errors)}")
+    else:
+        bid_cluster = liquidity.largest_bid_cluster
+        ask_cluster = liquidity.largest_ask_cluster
+        print(f"Spread:          {_fmt(liquidity.spread)}")
+        print(f"Book imbalance:  {_fmt(liquidity.book_imbalance)}")
+        print(f"Bid liquidity:   {_fmt(liquidity.bid_depth_1pct)} within 1%")
+        print(f"Ask liquidity:   {_fmt(liquidity.ask_depth_1pct)} within 1%")
+        print(
+            "Liquidity above: "
+            f"{_fmt(ask_cluster.price if ask_cluster else None)} "
+            f"notional={_fmt(ask_cluster.notional if ask_cluster else None)}"
+        )
+        print(
+            "Liquidity below: "
+            f"{_fmt(bid_cluster.price if bid_cluster else None)} "
+            f"notional={_fmt(bid_cluster.notional if bid_cluster else None)}"
+        )
+        print(f"Structure:       {liquidity.structure}")
+        print(f"Breakout state:  {liquidity.breakout_state}")
+        print(f"Liquidity sweep: {liquidity.liquidity_sweep}")
+        print(f"SMC signals:     {_list_text(liquidity.smc_signals)}")
+        print(f"Interpretation:  {liquidity.interpretation}")
+
+    liquidity_signal_names = {
+        "BID_LIQUIDITY_EXTREME",
+        "ASK_LIQUIDITY_EXTREME",
+        "ORDERBOOK_IMBALANCE_BID",
+        "ORDERBOOK_IMBALANCE_ASK",
+        "LIQUIDITY_VACUUM_ABOVE",
+        "LIQUIDITY_VACUUM_BELOW",
+        "BULLISH_BREAK_OF_STRUCTURE",
+        "BEARISH_BREAK_OF_STRUCTURE",
+        "CHANGE_OF_CHARACTER_BULLISH",
+        "CHANGE_OF_CHARACTER_BEARISH",
+        "LIQUIDITY_SWEEP_ABOVE",
+        "LIQUIDITY_SWEEP_BELOW",
+        "FAILED_BREAKOUT",
+        "DISPLACEMENT_UP",
+        "DISPLACEMENT_DOWN",
+        "FVG_ABOVE",
+        "FVG_BELOW",
+        "STRUCTURE_CROWDING_RISK_CONFLUENCE",
+        "CONSTRUCTIVE_STRUCTURE_FLOW_CONFLUENCE",
+    }
+    liquidity_signals = [
+        signal
+        for signal in state.signals
+        if signal.name in liquidity_signal_names
+    ]
+    print("Liquidity/structure signals:")
+    if liquidity_signals:
+        for signal in liquidity_signals:
+            print(
+                f"- {signal.name} "
+                f"strength={signal.strength} "
+                f"certainty={signal.certainty} "
+                f"evidence={signal.evidence}"
+            )
+    else:
+        print("None")
+
     print()
     print(f"Confluence:     {state.confluence}")
     print(f"Market regime:  {state.market_regime}")

@@ -118,11 +118,119 @@ La version actual no inventa datos de mercado. Si una senal no esta disponible e
 - Proveedores habituales: exchanges, Bookmap, Hyblock, Coinglass.
 - Nota: los mapas de liquidez son estimaciones, no certezas.
 
+### Liquidity + market structure
+
+#### Binance USD-M Futures order book
+
+- Datos: order book real de BTCUSDT perpetual futures (`/fapi/v1/depth`), bid/ask levels, spread, profundidad visible dentro de rangos de precio.
+- Free tier/API key: endpoint publico sin API key.
+- Rate limits: sujeto a peso por request y limites IP de Binance; exceso devuelve `429` y puede terminar en ban temporal si no se respeta backoff.
+- Coste: gratuito.
+- Exchange-specific vs aggregated: exchange-specific. Representa Binance USD-M Futures, no todo el mercado global.
+- Calidad: buena para libro visible de Binance; no muestra liquidez oculta, ordenes iceberg ni liquidez agregada de otras sedes.
+- Decision: implementado como primera capa real de order book. No genera evento `HIGH` por si solo salvo confluencia extrema con otras capas.
+
+#### Coinbase Advanced Trade public/Advanced API
+
+- Datos: product book para BTC-USD, best bid/ask, spread y niveles segun endpoint.
+- Free tier/API key: Coinbase Advanced product book documentado requiere autenticacion en endpoint avanzado; hay endpoints publicos de mercado en la familia Advanced/market segun documentacion.
+- Coste: sin coste directo de datos para endpoints permitidos, pero requiere configurar API/autenticacion si se usa Advanced.
+- Exchange-specific vs aggregated: exchange-specific spot Coinbase.
+- Calidad: buena para spot USD regulado, pero no sustituye derivados BTCUSDT.
+- Decision: documentado como segunda fuente futura, no activado en esta fase.
+
+#### Kraken public market data
+
+- Datos: order book/pre-trade depth en spot BTC/USD.
+- Free tier/API key: endpoints publicos de mercado sin API key; rate limits por IP.
+- Exchange-specific vs aggregated: exchange-specific spot Kraken.
+- Calidad: buena como contraste spot, menos directa para crowding de derivados.
+- Decision: documentado, no activado.
+
+#### CoinGlass
+
+- Datos: futures/spot order book history, large limit orders, liquidation heatmaps/maps, long/short, liquidations, CVD y otros datos agregados.
+- Free tier/API key: API V4 requiere API key; varias capas avanzadas dependen de plan.
+- Coste: proveedor profesional con planes de pago.
+- Exchange-specific vs aggregated: ofrece vistas por exchange y agregadas segun endpoint.
+- Calidad: util para mapas agregados, derivados y liquidaciones; los liquidation maps/heatmaps son modelos/estimaciones, no order book real.
+- Decision: documentado, no activado para evitar dependencia de pago/API key.
+
+#### Hyblock
+
+- Datos: liquidation heatmap y zonas predictivas de liquidacion por exchange/lookback.
+- Free tier/API key: requiere API key u OAuth2 segun documentacion.
+- Coste: proveedor profesional; no se activa sin decision explicita.
+- Exchange-specific vs aggregated: permite seleccionar venues/modelos.
+- Calidad: util para zonas estimadas de riesgo de liquidacion, no equivalente a resting orders reales.
+- Decision: documentado, no activado.
+
+#### Real order book vs liquidation maps
+
+- `REAL ORDER BOOK DATA`: niveles visibles de bids/asks en un exchange concreto en un momento concreto. Es observado, pero incompleto: no incluye liquidez oculta ni otros venues.
+- `ESTIMATED LIQUIDATION MAPS`: modelos que estiman zonas donde posiciones apalancadas podrian liquidarse. Son utiles para contexto, pero no son ordenes reales y deben tratarse como `INFERRED` o `SPECULATIVE`.
+
+#### Market structure / SMC
+
+- Radar usa estructura tecnica como heuristica: breakouts, failed breakouts, displacement, liquidity sweeps, FVG y break of structure.
+- Estas senales no prueban actividad institucional ni manipulacion.
+- Una senal SMC aislada nunca debe generar una publicacion final.
+- Para elevar confluence necesita coincidir con datos observables: order book, funding, OI, volumen, ETF flows, on-chain o sentimiento extremo.
+
 ### Sentimiento
 
 - Datos necesarios: Reddit, Telegram, X/Twitter si hay API legal, titulares, busquedas/tendencias.
 - Estado actual: Reddit RSS se ha retirado del feed activo porque devuelve 429 de forma recurrente.
 - Integracion robusta recomendada: API oficial o proveedor con rate limits claros.
+
+### Sentiment + positioning + crowding
+
+#### Santiment
+
+- Datos: social volume, social dominance, sentiment/narrative-style crypto metrics, on-chain/dev metrics y series historicas para BTC/ETH.
+- API: GraphQL en `https://api.santiment.net`.
+- Free tier/API key: API key opcional segun metrica. El plan gratuito ofrece 1,000 API calls/mes, 500/hora y 100/minuto para metricas accesibles; metricas restringidas pueden tener lag o limites historicos.
+- Coste: gratuito para una capa ligera; planes de pago para mas capacidad, acceso realtime o metricas restringidas.
+- Calidad: proveedor especializado en cripto social/on-chain desde 2014; util como proxy de narrativa/retail attention, no como verdad de mercado.
+- Limitaciones: algunas metricas realtime o avanzadas pueden no estar disponibles en free tier. Si la clave falta, la API falla o una metrica no esta accesible, Radar deja `SENTIMENT: UNKNOWN`.
+- Decision: primera integracion opcional via `SANTIMENT_API_KEY`. Radar no depende de ella para funcionar.
+
+#### Reddit Data API
+
+- Datos: posts/comentarios por subreddit, intensidad de discusion, narrativa retail.
+- API: Reddit Data API con OAuth obligatorio.
+- Free tier/API key: clientes elegibles tienen 100 QPM por OAuth client id. Trafico no autenticado puede ser bloqueado.
+- Coste: gratuito para usos elegibles; Reddit puede requerir acuerdos para usos comerciales o mayores volumenes.
+- Calidad: buena para participacion retail/narrativas, debil para inferir posicionamiento real.
+- Limitaciones: requiere OAuth, User-Agent correcto y cumplimiento de terminos. No se debe usar RSS no autenticado como fuente robusta.
+- Decision: documentado, no activado todavia.
+
+#### The Tie
+
+- Datos: sentimiento cuantitativo, actividad social, noticias/narrativas y analytics cripto institucionales.
+- API: endpoints REST con header `x-api-key`.
+- Free tier/API key: requiere API key; orientado a clientes profesionales/institucionales.
+- Coste: proveedor comercial; no se activa sin decision explicita.
+- Calidad: alta para sentimiento cripto estructurado, pero dependencia externa de pago.
+- Decision: documentado, no activado.
+
+#### Google Trends / search interest
+
+- Datos: interes de busqueda retail y atencion publica.
+- API: no hay API oficial estable de Google Trends para esta integracion.
+- Alternativas: librerias no oficiales como pytrends, pero dependen de comportamiento web no garantizado.
+- Decision: documentado, no implementado para evitar scraping fragil.
+
+La capa implementada combina:
+
+- `RETAIL SENTIMENT`: observado desde una fuente agregada cuando exista.
+- `MARKET SENTIMENT`: inferido desde derivados/precio/volatilidad.
+- `POSITIONING`: inferido desde OI, funding, liquidaciones y volumen.
+- `CROWDING`: solo cuando sentimiento y posicionamiento apuntan juntos.
+- `INSTITUTIONAL FLOW PROXY`: inferencia basada en ETF flows y on-chain; no afirma actividad institucional directa.
+- `DIVERGENCE`: inferencia cuando retail, derivados, ETF/on-chain o narrativa no estan alineados.
+
+Una senal social aislada no crea evento `HIGH`. Para producir un evento sintetico `MARKET_STATE`, Radar exige confluencia o divergencia clara con derivados/flows/on-chain.
 
 ## Capas de certeza
 

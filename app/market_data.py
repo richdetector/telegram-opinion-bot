@@ -186,6 +186,15 @@ class BinanceMarketDataClient:
             },
         )
 
+    def depth(self, symbol=BTC_SYMBOL, limit=1000):
+        return self.get_json(
+            "/fapi/v1/depth",
+            {
+                "symbol": symbol,
+                "limit": limit,
+            },
+        )
+
     def force_orders(self, symbol=BTC_SYMBOL, limit=100):
         return self.get_json(
             "/fapi/v1/allForceOrders",
