@@ -21,6 +21,50 @@ La version actual no inventa datos de mercado. Si una senal no esta disponible e
 
 ### Opciones investigadas
 
+#### Glassnode
+
+- Datos: exchange inflows, exchange outflows, exchange netflows, exchange balances/reserves, whale deposits/withdrawals to/from exchanges, miner flows, LTH/STH and dormancy-style metrics.
+- API: REST `https://api.glassnode.com/v1/metrics/...`.
+- Free tier/API key: API key required. API access is not automatically included in all plans and may require an add-on.
+- Coste: depends on Glassnode plan/API access.
+- Wallet/exchange labels: exchange and entity labels maintained by Glassnode; metrics are based on labeled exchange addresses plus data-science/statistical methods.
+- Historico: broad historical coverage depending on metric/tier.
+- BTC coverage: strong.
+- Fiabilidad: high-quality specialized on-chain provider, but recent data can be mutable as labels/statistical attribution improve.
+- Decision: implemented as optional provider via `GLASSNODE_API_KEY`. If missing or unavailable, Radar keeps on-chain fields `UNKNOWN` and produces no on-chain signals.
+
+#### Whale Alert
+
+- Datos: large transactions, whale alerts, exchange attribution, transaction owners/labels depending on plan.
+- API: WebSocket alerts API and REST enterprise API.
+- Free tier/API key: requires developer account/API key and paid subscription/trial.
+- Coste: Alerts plan listed at paid monthly pricing; REST/quantitative access is substantially higher.
+- Wallet labels: exchange attribution included; depth depends on subscription.
+- Historico: limited recent history for API; historical datasets sold separately.
+- BTC coverage: yes.
+- Fiabilidad: useful for whale transaction alerts, but not enough for aggregate exchange-flow baselines unless on paid API.
+- Decision: documented only. Not activated.
+
+#### CryptoQuant
+
+- Datos: BTC exchange inflows/outflows/reserves, miner flows, derivatives/on-chain analytics.
+- API: REST endpoints such as BTC exchange flows.
+- API key: required.
+- Coste: API access requires Professional/Premium plan.
+- Wallet/exchange labels: specialized on-chain exchange labeling.
+- BTC coverage: strong.
+- Decision: documented only. Not activated to avoid paid dependency.
+
+#### Coin Metrics Community API
+
+- Datos: some community asset and exchange metrics without API key; paid tier has broader metrics.
+- API: REST `https://community-api.coinmetrics.io/v4`.
+- Free tier/API key: community API no key for selected data.
+- Coste: community free for non-commercial use; pro data paid.
+- Wallet labels: not focused on wallet/entity attribution.
+- BTC coverage: strong for general network/market metrics, weaker for labeled whale/exchange-flow intelligence.
+- Decision: not used for on-chain exchange labels in this phase.
+
 #### CoinGlass
 
 - Datos: derivados, options, ETF flows, on-chain, liquidity maps, order book, whale/large position metrics.

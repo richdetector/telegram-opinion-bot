@@ -3,8 +3,10 @@ from dataclasses import dataclass, field
 from market_data import (
     BtcEtfFlowSnapshot,
     BtcMarketSnapshot,
+    BtcOnchainSnapshot,
     fetch_btc_etf_flow_snapshot,
     fetch_btc_market_snapshot,
+    fetch_btc_onchain_snapshot,
 )
 from models import NewsItem
 
@@ -21,10 +23,12 @@ class MarketSignal:
 class BtcMarketState:
     snapshot: BtcMarketSnapshot
     etf_flows: BtcEtfFlowSnapshot | None = None
+    onchain: BtcOnchainSnapshot | None = None
     signals: list[MarketSignal] = field(default_factory=list)
     confluence: str = "LOW"
     confluence_score: int = 0
     market_regime: str = "UNKNOWN"
+    onchain_regime: str = "UNKNOWN"
     summary: str = "NO MATERIAL BTC MARKET ANOMALY"
 
 
@@ -124,7 +128,105 @@ def _analyze_etf_flow_signals(etf_flows):
     return signals
 
 
-def analyze_btc_market_state(snapshot, etf_flows=None):
+def _analyze_onchain_signals(onchain):
+    if onchain is None:
+        return []
+
+    signals = []
+
+    inflow_z = onchain.btc_exchange_inflow_zscore
+    outflow_z = onchain.btc_exchange_outflow_zscore
+    netflow_z = onchain.btc_exchange_netflow_zscore
+    reserve_1d = onchain.btc_exchange_reserve_change_1d
+    reserve_7d = onchain.btc_exchange_reserve_change_7d
+    miner_z = onchain.btc_miner_to_exchange_zscore
+
+    if inflow_z is not None and inflow_z >= 2:
+        _add_signal(
+            signals,
+            "EXCHANGE_INFLOW_EXTREME" if inflow_z >= 3 else "EXCHANGE_INFLOW_ELEVATED",
+            min(100, inflow_z * 28),
+            "CALCULATED",
+            f"Exchange inflow z-score vs recent baseline: {inflow_z:.2f}",
+        )
+
+    if outflow_z is not None and outflow_z >= 2:
+        _add_signal(
+            signals,
+            "EXCHANGE_OUTFLOW_EXTREME" if outflow_z >= 3 else "EXCHANGE_OUTFLOW_ELEVATED",
+            min(100, outflow_z * 28),
+            "CALCULATED",
+            f"Exchange outflow z-score vs recent baseline: {outflow_z:.2f}",
+        )
+
+    if netflow_z is not None:
+        if netflow_z >= 2.5:
+            _add_signal(
+                signals,
+                "NETFLOW_POSITIVE_EXTREME",
+                min(100, netflow_z * 28),
+                "CALCULATED",
+                f"Exchange netflow z-score: {netflow_z:.2f}",
+            )
+        elif netflow_z <= -2.5:
+            _add_signal(
+                signals,
+                "NETFLOW_NEGATIVE_EXTREME",
+                min(100, abs(netflow_z) * 28),
+                "CALCULATED",
+                f"Exchange netflow z-score: {netflow_z:.2f}",
+            )
+
+    if reserve_1d is not None and reserve_7d is not None:
+        if reserve_1d > 0.5 and reserve_7d > 1:
+            _add_signal(
+                signals,
+                "EXCHANGE_RESERVES_RISING",
+                min(100, (reserve_1d + reserve_7d) * 20),
+                "CALCULATED",
+                f"Exchange reserves change: 1d {reserve_1d:.2f}%, 7d {reserve_7d:.2f}%",
+            )
+        elif reserve_1d < -0.5 and reserve_7d < -1:
+            _add_signal(
+                signals,
+                "EXCHANGE_RESERVES_FALLING",
+                min(100, abs(reserve_1d + reserve_7d) * 20),
+                "CALCULATED",
+                f"Exchange reserves change: 1d {reserve_1d:.2f}%, 7d {reserve_7d:.2f}%",
+            )
+
+    if onchain.btc_large_transfer_count is not None and onchain.btc_large_transfer_count >= 3:
+        _add_signal(
+            signals,
+            "WHALE_ACTIVITY_SPIKE",
+            min(100, onchain.btc_large_transfer_count * 18),
+            "OBSERVED",
+            f"{onchain.btc_large_transfer_count} large BTC transfers observed.",
+        )
+
+    if miner_z is not None and miner_z >= 2.5:
+        _add_signal(
+            signals,
+            "MINER_TO_EXCHANGE_SPIKE",
+            min(100, miner_z * 28),
+            "CALCULATED",
+            f"Miner-to-exchange flow z-score: {miner_z:.2f}",
+        )
+
+    return signals
+
+
+def _onchain_regime(signal_names):
+    if {"EXCHANGE_OUTFLOW_EXTREME", "EXCHANGE_RESERVES_FALLING"} <= signal_names:
+        return "ACCUMULATION"
+    if {"EXCHANGE_INFLOW_EXTREME", "EXCHANGE_RESERVES_RISING"} <= signal_names:
+        return "DISTRIBUTION"
+    if signal_names:
+        return "NEUTRAL"
+    return "UNKNOWN"
+
+
+def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None):
     signals = []
 
     if snapshot.open_interest_change is not None:
@@ -214,6 +316,8 @@ def analyze_btc_market_state(snapshot, etf_flows=None):
 
     etf_signals = _analyze_etf_flow_signals(etf_flows)
     signals.extend(etf_signals)
+    onchain_signals = _analyze_onchain_signals(onchain)
+    signals.extend(onchain_signals)
     signal_names = {signal.name for signal in signals}
 
     if {"OI_RISING_FAST", "FUNDING_EXTREME_POSITIVE", "VOLUME_SPIKE"} <= signal_names:
@@ -248,6 +352,30 @@ def analyze_btc_market_state(snapshot, etf_flows=None):
             78,
             "INFERRED",
             "ETF outflows are aligned with elevated leverage or positioning risk.",
+        )
+
+    if (
+        {"ETF_INFLOW_STRONG", "EXCHANGE_OUTFLOW_EXTREME"} <= signal_names
+        or {"ETF_POSITIVE_REGIME", "EXCHANGE_RESERVES_FALLING"} <= signal_names
+    ):
+        _add_signal(
+            signals,
+            "CUSTODY_SUPPLY_CONFLUENCE",
+            82,
+            "INFERRED",
+            "ETF flow strength and exchange outflow/reserve signals align.",
+        )
+
+    if (
+        {"EXCHANGE_INFLOW_EXTREME", "EXCHANGE_RESERVES_RISING", "OI_RISING_FAST"} <= signal_names
+        or {"EXCHANGE_INFLOW_EXTREME", "FUNDING_EXTREME_POSITIVE"} <= signal_names
+    ):
+        _add_signal(
+            signals,
+            "ONCHAIN_DISTRIBUTION_RISK_CONFLUENCE",
+            84,
+            "INFERRED",
+            "Exchange inflow/reserve pressure aligns with leverage or positioning risk.",
         )
 
     if (
@@ -287,6 +415,14 @@ def analyze_btc_market_state(snapshot, etf_flows=None):
         confluence = "HIGH"
         regime = "DISTRIBUTION_RISK"
         summary = "BTC ETF outflows and positioning show elevated distribution/deleveraging risk."
+    elif "CUSTODY_SUPPLY_CONFLUENCE" in signal_names:
+        confluence = "HIGH"
+        regime = "ACCUMULATION_CONSISTENT"
+        summary = "BTC ETF and on-chain flows are consistent with reduced exchange supply, without proving accumulation."
+    elif "ONCHAIN_DISTRIBUTION_RISK_CONFLUENCE" in signal_names:
+        confluence = "HIGH"
+        regime = "DISTRIBUTION_RISK"
+        summary = "BTC on-chain exchange inflows and positioning show elevated distribution-risk confluence."
     elif confluence_score >= 45 and len(signals) >= 2:
         confluence = "MEDIUM"
         regime = "HIGH_VOLATILITY"
@@ -299,10 +435,12 @@ def analyze_btc_market_state(snapshot, etf_flows=None):
     return BtcMarketState(
         snapshot=snapshot,
         etf_flows=etf_flows,
+        onchain=onchain,
         signals=signals,
         confluence=confluence,
         confluence_score=confluence_score,
         market_regime=regime,
+        onchain_regime=_onchain_regime(signal_names),
         summary=summary,
     )
 
@@ -359,6 +497,7 @@ def market_state_to_news_item(state):
 def fetch_btc_market_state(
     fetcher=fetch_btc_market_snapshot,
     etf_fetcher=fetch_btc_etf_flow_snapshot,
+    onchain_fetcher=fetch_btc_onchain_snapshot,
 ):
     try:
         snapshot = fetcher()
@@ -374,4 +513,11 @@ def fetch_btc_market_state(
             errors=[f"etf_flows:{type(exc).__name__}"]
         )
 
-    return analyze_btc_market_state(snapshot, etf_flows)
+    try:
+        onchain = onchain_fetcher()
+    except Exception as exc:
+        onchain = BtcOnchainSnapshot(
+            errors=[f"onchain:{type(exc).__name__}"]
+        )
+
+    return analyze_btc_market_state(snapshot, etf_flows, onchain)

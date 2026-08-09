@@ -20,6 +20,7 @@ from dry_run_report import print_dry_run_report
 from editor_selector import select_news_with_ai
 from market_scorer import score_market_item
 from market_data import BtcEtfFlowSnapshot, BtcMarketSnapshot
+from market_data import BtcOnchainSnapshot, LargeBtcTransfer, classify_large_transfer
 from models import NewsItem
 from publishing import DryRunPublishBlocked
 
@@ -594,6 +595,197 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertNotIn("sell", text)
         self.assertNotIn("compra", text)
         self.assertNotIn("vende", text)
+
+    def test_isolated_whale_transfer_is_not_event(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            BtcOnchainSnapshot(
+                btc_large_transfer_count=1,
+                btc_large_transfer_volume=10_000,
+                btc_whale_activity="OBSERVED",
+                large_transfers=[
+                    LargeBtcTransfer(
+                        amount_btc=10_000,
+                        from_label="unknown",
+                        to_label="unknown",
+                    )
+                ],
+            ),
+        )
+
+        self.assertEqual(state.confluence, "LOW")
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_slight_exchange_inflow_is_not_high_signal(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            BtcOnchainSnapshot(
+                btc_exchange_inflow=1000,
+                btc_exchange_inflow_zscore=1.2,
+            ),
+        )
+
+        self.assertNotIn("EXCHANGE_INFLOW_ELEVATED", [signal.name for signal in state.signals])
+        self.assertEqual(state.confluence, "LOW")
+
+    def test_extreme_exchange_inflow_is_strong_signal(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            BtcOnchainSnapshot(
+                btc_exchange_inflow=5000,
+                btc_exchange_inflow_zscore=3.2,
+            ),
+        )
+
+        self.assertIn("EXCHANGE_INFLOW_EXTREME", [signal.name for signal in state.signals])
+        self.assertNotEqual(state.confluence, "HIGH")
+
+    def test_outflows_extreme_and_reserves_falling_is_accumulation_consistent(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            BtcOnchainSnapshot(
+                btc_exchange_outflow=6000,
+                btc_exchange_outflow_zscore=3.1,
+                btc_exchange_reserves=2_000_000,
+                btc_exchange_reserve_change_1d=-0.8,
+                btc_exchange_reserve_change_7d=-1.5,
+            ),
+        )
+
+        self.assertEqual(state.onchain_regime, "ACCUMULATION")
+        self.assertIn("EXCHANGE_OUTFLOW_EXTREME", [signal.name for signal in state.signals])
+        self.assertIn("EXCHANGE_RESERVES_FALLING", [signal.name for signal in state.signals])
+
+    def test_inflows_extreme_and_reserves_rising_is_distribution_risk(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            BtcOnchainSnapshot(
+                btc_exchange_inflow=6000,
+                btc_exchange_inflow_zscore=3.1,
+                btc_exchange_reserves=2_200_000,
+                btc_exchange_reserve_change_1d=0.8,
+                btc_exchange_reserve_change_7d=1.6,
+            ),
+        )
+
+        self.assertEqual(state.onchain_regime, "DISTRIBUTION")
+        self.assertIn("EXCHANGE_INFLOW_EXTREME", [signal.name for signal in state.signals])
+        self.assertIn("EXCHANGE_RESERVES_RISING", [signal.name for signal in state.signals])
+
+    def test_unknown_wallet_transfer_classification(self):
+        transfer = LargeBtcTransfer(
+            amount_btc=5000,
+            from_label="unknown wallet",
+            to_label="unknown wallet",
+        )
+
+        self.assertEqual(classify_large_transfer(transfer), "UNKNOWN")
+
+    def test_onchain_api_unavailable_keeps_radar_alive(self):
+        def failing_onchain_fetcher():
+            raise RuntimeError("onchain down")
+
+        state = fetch_btc_market_state(
+            fetcher=lambda: BtcMarketSnapshot(),
+            etf_fetcher=lambda: BtcEtfFlowSnapshot(),
+            onchain_fetcher=failing_onchain_fetcher,
+        )
+
+        self.assertIn("onchain:RuntimeError", state.onchain.errors)
+        self.assertEqual(state.confluence, "LOW")
+
+    def test_onchain_missing_data_does_not_invent(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            BtcOnchainSnapshot(errors=["onchain:NO_DATA"]),
+        )
+
+        self.assertEqual(state.onchain_regime, "UNKNOWN")
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_onchain_etf_derivatives_confluence_increases(self):
+        base = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=9.0,
+                funding_rate=0.0001,
+                funding_extreme="NORMAL",
+            ),
+            None,
+            None,
+        )
+        with_onchain = analyze_btc_market_state(
+            BtcMarketSnapshot(
+                open_interest_change=9.0,
+                funding_rate=0.0001,
+                funding_extreme="NORMAL",
+            ),
+            BtcEtfFlowSnapshot(
+                btc_etf_net_flow=700_000_000,
+                btc_etf_flow_3d_avg=350_000_000,
+                btc_etf_flow_7d_avg=100_000_000,
+                btc_etf_flow_zscore=2.8,
+                btc_etf_flow_streak=1,
+            ),
+            BtcOnchainSnapshot(
+                btc_exchange_outflow=7000,
+                btc_exchange_outflow_zscore=3.2,
+                btc_exchange_reserves=2_000_000,
+                btc_exchange_reserve_change_1d=-0.8,
+                btc_exchange_reserve_change_7d=-1.4,
+            ),
+        )
+
+        self.assertGreater(with_onchain.confluence_score, base.confluence_score)
+        self.assertEqual(with_onchain.confluence, "HIGH")
+
+    def test_onchain_never_produces_buy_sell_language(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            BtcOnchainSnapshot(
+                btc_exchange_inflow=6000,
+                btc_exchange_inflow_zscore=3.1,
+                btc_exchange_reserves=2_200_000,
+                btc_exchange_reserve_change_1d=0.8,
+                btc_exchange_reserve_change_7d=1.6,
+            ),
+        )
+        text = " ".join(
+            f"{signal.name} {signal.evidence}"
+            for signal in state.signals
+        ).lower()
+
+        self.assertNotIn("buy", text)
+        self.assertNotIn("sell", text)
+        self.assertNotIn("compra", text)
+        self.assertNotIn("vende", text)
+
+    def test_onchain_never_claims_institutions_are_buying_without_direct_evidence(self):
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            BtcEtfFlowSnapshot(
+                btc_etf_net_flow=700_000_000,
+                btc_etf_flow_zscore=2.8,
+                btc_etf_flow_streak=1,
+            ),
+            BtcOnchainSnapshot(
+                btc_exchange_outflow=7000,
+                btc_exchange_outflow_zscore=3.2,
+                btc_exchange_reserve_change_1d=-0.8,
+                btc_exchange_reserve_change_7d=-1.4,
+            ),
+        )
+        text = f"{state.summary} " + " ".join(signal.evidence for signal in state.signals)
+        text = text.lower()
+
+        self.assertNotIn("institutions are buying", text)
+        self.assertNotIn("las instituciones están comprando", text)
 
 
 if __name__ == "__main__":

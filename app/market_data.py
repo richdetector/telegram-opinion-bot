@@ -5,11 +5,12 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from config import BLOCKWORKS_API_KEY
+from config import BLOCKWORKS_API_KEY, GLASSNODE_API_KEY
 
 
 BINANCE_FAPI_BASE_URL = "https://fapi.binance.com"
 BLOCKWORKS_API_BASE_URL = "https://api.blockworks.com"
+GLASSNODE_API_BASE_URL = "https://api.glassnode.com"
 BTC_SYMBOL = "BTCUSDT"
 
 
@@ -57,6 +58,37 @@ class BtcEtfFlowSnapshot:
     btc_etf_flow_streak: int | None = None
     btc_etf_flow_timestamp: str = ""
     provider: str = "Blockworks ETF flows"
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LargeBtcTransfer:
+    amount_btc: float | None = None
+    from_label: str = ""
+    to_label: str = ""
+    classification: str = "UNKNOWN"
+    certainty: str = "OBSERVED"
+
+
+@dataclass
+class BtcOnchainSnapshot:
+    btc_exchange_inflow: float | None = None
+    btc_exchange_outflow: float | None = None
+    btc_exchange_netflow: float | None = None
+    btc_exchange_reserves: float | None = None
+    btc_exchange_inflow_zscore: float | None = None
+    btc_exchange_outflow_zscore: float | None = None
+    btc_exchange_netflow_zscore: float | None = None
+    btc_exchange_reserve_change_1d: float | None = None
+    btc_exchange_reserve_change_7d: float | None = None
+    btc_large_transfer_count: int | None = None
+    btc_large_transfer_volume: float | None = None
+    btc_whale_activity: str = "UNKNOWN"
+    btc_miner_to_exchange: float | None = None
+    btc_miner_to_exchange_zscore: float | None = None
+    btc_onchain_timestamp: str = ""
+    provider: str = "Glassnode"
+    large_transfers: list[LargeBtcTransfer] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -202,6 +234,33 @@ class BlockworksEtfFlowClient:
         return rows[-limit_days:] if limit_days else rows
 
 
+class GlassnodeOnchainClient:
+
+    def __init__(
+        self,
+        api_key=GLASSNODE_API_KEY,
+        base_url=GLASSNODE_API_BASE_URL,
+        timeout=10,
+    ):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.timeout = timeout
+
+    def metric(self, path, days=30, interval="24h"):
+        if not self.api_key:
+            raise RuntimeError("GLASSNODE_API_KEY missing")
+
+        request = Request(
+            f"{self.base_url}/v1/metrics{path}?{urlencode({'a': 'BTC', 'i': interval, 'api_key': self.api_key})}",
+            headers={"User-Agent": "RadarMarketIntelligence/1.0"},
+        )
+
+        with urlopen(request, timeout=self.timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        return data[-days:] if days else data
+
+
 def _kline_close(kline):
     return _safe_float(kline[4])
 
@@ -305,6 +364,16 @@ def _flow_streak(values):
     return streak
 
 
+def _latest_metric_value(rows):
+    values = [
+        _safe_float(row.get("v"))
+        for row in rows or []
+        if _safe_float(row.get("v")) is not None
+    ]
+    latest = values[-1] if values else None
+    return latest, values
+
+
 def normalize_btc_etf_flows(rows):
     snapshot = BtcEtfFlowSnapshot(
         btc_etf_flow_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -351,4 +420,127 @@ def fetch_btc_etf_flow_snapshot(client=None):
             btc_etf_flow_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds")
         )
         snapshot.errors.append(f"etf_flows:{type(exc).__name__}")
+        return snapshot
+
+
+def classify_large_transfer(transfer):
+    from_label = (transfer.from_label or "").lower()
+    to_label = (transfer.to_label or "").lower()
+
+    from_exchange = "exchange" in from_label or any(
+        name in from_label
+        for name in ["binance", "coinbase", "kraken", "okx", "bybit"]
+    )
+    to_exchange = "exchange" in to_label or any(
+        name in to_label
+        for name in ["binance", "coinbase", "kraken", "okx", "bybit"]
+    )
+
+    if from_exchange and to_exchange:
+        return "INTERNAL_TRANSFER"
+    if to_exchange:
+        return "EXCHANGE_INFLOW"
+    if from_exchange:
+        return "EXCHANGE_OUTFLOW"
+    if "custody" in from_label or "custody" in to_label:
+        return "CUSTODY"
+    if "miner" in from_label or "miner" in to_label:
+        return "MINER"
+    if "institution" in from_label or "institution" in to_label:
+        return "INSTITUTIONAL"
+    if "otc" in from_label or "otc" in to_label:
+        return "OTC_POSSIBLE"
+
+    return "UNKNOWN"
+
+
+def normalize_btc_onchain_snapshot(metrics, large_transfers=None):
+    snapshot = BtcOnchainSnapshot(
+        btc_onchain_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds")
+    )
+
+    inflow, inflows = _latest_metric_value(metrics.get("exchange_inflow"))
+    outflow, outflows = _latest_metric_value(metrics.get("exchange_outflow"))
+    netflow, netflows = _latest_metric_value(metrics.get("exchange_netflow"))
+    reserves, reserves_series = _latest_metric_value(metrics.get("exchange_reserves"))
+    miner, miners = _latest_metric_value(metrics.get("miner_to_exchange"))
+    whale_in, whale_ins = _latest_metric_value(metrics.get("whale_to_exchange"))
+    whale_out, whale_outs = _latest_metric_value(metrics.get("exchange_to_whale"))
+
+    snapshot.btc_exchange_inflow = inflow
+    snapshot.btc_exchange_outflow = outflow
+    snapshot.btc_exchange_netflow = netflow
+    snapshot.btc_exchange_reserves = reserves
+    snapshot.btc_exchange_inflow_zscore = _zscore(inflow, inflows[:-1])
+    snapshot.btc_exchange_outflow_zscore = _zscore(outflow, outflows[:-1])
+    snapshot.btc_exchange_netflow_zscore = _zscore(netflow, netflows[:-1])
+    snapshot.btc_miner_to_exchange = miner
+    snapshot.btc_miner_to_exchange_zscore = _zscore(miner, miners[:-1])
+
+    if reserves is not None and len(reserves_series) >= 2:
+        snapshot.btc_exchange_reserve_change_1d = _pct_change(reserves, reserves_series[-2])
+    if reserves is not None and len(reserves_series) >= 8:
+        snapshot.btc_exchange_reserve_change_7d = _pct_change(reserves, reserves_series[-8])
+
+    whale_values = [
+        value
+        for value in [whale_in, whale_out]
+        if value is not None
+    ]
+    if whale_values:
+        snapshot.btc_large_transfer_volume = sum(whale_values)
+        snapshot.btc_whale_activity = "OBSERVED"
+
+    transfers = large_transfers or []
+    for transfer in transfers:
+        transfer.classification = classify_large_transfer(transfer)
+        snapshot.large_transfers.append(transfer)
+
+    if transfers:
+        snapshot.btc_large_transfer_count = len(transfers)
+        transfer_volume = sum(
+            transfer.amount_btc or 0
+            for transfer in transfers
+        )
+        snapshot.btc_large_transfer_volume = (
+            (snapshot.btc_large_transfer_volume or 0)
+            + transfer_volume
+        )
+        snapshot.btc_whale_activity = "OBSERVED"
+
+    if not any(
+        value is not None
+        for value in [
+            inflow,
+            outflow,
+            netflow,
+            reserves,
+            miner,
+            snapshot.btc_large_transfer_volume,
+        ]
+    ):
+        snapshot.errors.append("onchain:NO_DATA")
+
+    return snapshot
+
+
+def fetch_btc_onchain_snapshot(client=None):
+    client = client or GlassnodeOnchainClient()
+
+    try:
+        metrics = {
+            "exchange_inflow": client.metric("/transactions/transfers_volume_to_exchanges_sum"),
+            "exchange_outflow": client.metric("/transactions/transfers_volume_from_exchanges_sum"),
+            "exchange_netflow": client.metric("/transactions/transfers_volume_exchanges_net"),
+            "exchange_reserves": client.metric("/distribution/balance_exchanges"),
+            "miner_to_exchange": client.metric("/transactions/transfers_volume_miners_to_exchanges"),
+            "whale_to_exchange": client.metric("/transactions/transfers_volume_whales_to_exchanges_sum"),
+            "exchange_to_whale": client.metric("/transactions/transfers_volume_exchanges_to_whales_sum"),
+        }
+        return normalize_btc_onchain_snapshot(metrics)
+    except Exception as exc:
+        snapshot = BtcOnchainSnapshot(
+            btc_onchain_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds")
+        )
+        snapshot.errors.append(f"onchain:{type(exc).__name__}")
         return snapshot

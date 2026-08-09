@@ -109,6 +109,27 @@ def print_btc_market_state(state):
         print("NO MATERIAL BTC MARKET ANOMALY")
 
     print()
+    print("ON-CHAIN")
+    onchain = state.onchain
+    if onchain is None or (
+        onchain.btc_exchange_inflow is None
+        and onchain.btc_exchange_outflow is None
+        and onchain.btc_exchange_netflow is None
+        and onchain.btc_exchange_reserves is None
+        and onchain.btc_large_transfer_volume is None
+    ):
+        print("ON-CHAIN: UNKNOWN")
+        if onchain and onchain.errors:
+            print(f"On-chain errors: {_list_text(onchain.errors)}")
+    else:
+        print(f"Exchange inflows:  {_fmt(onchain.btc_exchange_inflow)}")
+        print(f"Exchange outflows: {_fmt(onchain.btc_exchange_outflow)}")
+        print(f"Netflow:           {_fmt(onchain.btc_exchange_netflow)}")
+        print(f"Reserves:          {_fmt(onchain.btc_exchange_reserves)}")
+        print(f"Whale activity:    {onchain.btc_whale_activity}")
+
+    print(f"On-chain regime: {state.onchain_regime}")
+    print()
     print(f"Confluence:     {state.confluence}")
     print(f"Market regime:  {state.market_regime}")
     print("========================================\n")
