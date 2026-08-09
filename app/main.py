@@ -6,41 +6,65 @@ from telegram_reader import get_telegram_news
 
 from filter import clean_news
 from classifier import classify_news
+from market_scorer import can_reach_selection, score_market_news
+from verification import passes_publish_safety, verify_news
+from deduper import dedupe_news
 from enricher import enrich_metadata
 
 from editor_selector import select_news_with_ai
 from editor_writer import write_news
 from editor_reviewer import review_report
 
+from auto_publish_engine import should_auto_publish
 from formatter import format_report
-from telegram_bot import send_review, publish_message
+from telegram_bot import publish_message
 from history import was_sent, remember
-from pending import add_pending, is_pending
+from pending import is_pending
 
 
-CANDIDATES = 15
-AUTO_PUBLISH_SCORE = 95
+PRE_CANDIDATES = 30
+MAX_PUBLICATIONS = 2
+RSS_LIMIT_PER_FEED = 10
+TELEGRAM_LIMIT_PER_CHANNEL = 3
+
+
+def _preselect_market_candidates(news):
+
+    candidates = [
+        item
+        for item in news
+        if can_reach_selection(item)
+    ]
+
+    candidates.sort(
+        key=lambda item: (
+            item.materiality == "CRITICAL",
+            item.market_impact,
+            item.confluence_score,
+            item.source_reliability,
+            item.source_speed,
+        ),
+        reverse=True,
+    )
+
+    return candidates[:PRE_CANDIDATES]
 
 
 async def process_news():
 
     start = time.perf_counter()
 
-    # RSS + Telegram
-    rss_start = time.perf_counter()
+    acquisition_start = time.perf_counter()
 
-    rss_news = get_news(limit_per_feed=10)
-
-    telegram_news = await get_telegram_news(limit=3)
-
+    rss_news = get_news(limit_per_feed=RSS_LIMIT_PER_FEED)
+    telegram_news = await get_telegram_news(limit=TELEGRAM_LIMIT_PER_CHANNEL)
     noticias = rss_news + telegram_news
 
-    rss_time = time.perf_counter() - rss_start
+    acquisition_time = time.perf_counter() - acquisition_start
 
     total_rss = len(rss_news)
     total_telegram = len(telegram_news)
 
-    # Historial + pendientes
     noticias = [
         n
         for n in noticias
@@ -50,111 +74,110 @@ async def process_news():
 
     total_after_history = len(noticias)
 
-    # Limpieza
     noticias = clean_news(noticias)
     total_clean = len(noticias)
 
-    # Clasificador
     classifier_start = time.perf_counter()
     noticias = classify_news(noticias)
+    noticias = score_market_news(noticias)
     classifier_time = time.perf_counter() - classifier_start
 
-    # Top candidatas
-    noticias.sort(key=lambda n: n.score, reverse=True)
-    noticias = noticias[:CANDIDATES]
-    total_candidates = len(noticias)
+    noticias = _preselect_market_candidates(noticias)
+    total_precandidates = len(noticias)
 
-    # Enriquecimiento IA
+    if not noticias:
+        print("\n✅ No hay señales con impacto material suficiente.\n")
+        return
+
+    download_start = time.perf_counter()
+    noticias = enrich_news(noticias)
+    noticias = score_market_news(noticias)
+    download_time = time.perf_counter() - download_start
+
     enricher_start = time.perf_counter()
     noticias = enrich_metadata(noticias)
+    noticias = score_market_news(noticias)
+    noticias = verify_news(noticias)
+    noticias = dedupe_news(noticias)
     enricher_time = time.perf_counter() - enricher_start
 
-    print("\n==================== SCORES ====================")
+    noticias.sort(
+        key=lambda n: (
+            n.materiality == "CRITICAL",
+            n.market_impact,
+            n.confluence_score,
+            n.source_reliability,
+        ),
+        reverse=True,
+    )
+
+    print("\n==================== MARKET IMPACT ====================")
 
     for noticia in noticias:
 
         print(
-            f"{noticia.score:>3} | "
-            f"{noticia.editorial_topic:<30} | "
+            f"{noticia.market_impact:>3} | "
+            f"{noticia.materiality:<8} | "
+            f"{noticia.verification_status:<11} | "
+            f"{','.join(noticia.affected_assets)[:28]:<28} | "
             f"{noticia.title}"
         )
 
-    print("================================================\n")
+    print("=======================================================\n")
 
-    # Reordenar por score IA
-    noticias.sort(key=lambda n: n.score, reverse=True)
-
-    # Selector IA
     selector_start = time.perf_counter()
     noticias = select_news_with_ai(noticias)
+    noticias = noticias[:MAX_PUBLICATIONS]
     selector_time = time.perf_counter() - selector_start
 
-    # Si hoy no hay ninguna noticia realmente importante
+    noticias = [
+        item
+        for item in noticias
+        if passes_publish_safety(item)
+    ]
+
     if not noticias:
 
-        print("\n✅ No hay noticias suficientemente relevantes para publicar.\n")
+        print("\n✅ El selector no encontró acontecimientos publicables.\n")
         return
 
-    # Descargar contenido completo
-    download_start = time.perf_counter()
-    noticias = enrich_news(noticias)
-    download_time = time.perf_counter() - download_start
-
-    # Writer
     writer_start = time.perf_counter()
     informe = write_news(noticias)
     writer_time = time.perf_counter() - writer_start
 
-    # Reviewer
     reviewer_start = time.perf_counter()
     revision = review_report(informe, len(noticias))
     reviewer_time = time.perf_counter() - reviewer_start
 
-    if not revision["ok"]:
+    if not should_auto_publish(revision, noticias):
 
-        print("\n⚠️ Observaciones del reviewer:\n")
+        print("\n⛔ Reviewer bloqueó la publicación:\n")
 
-        for error in revision["errors"]:
+        for error in revision.get("errors", []):
             print("-", error)
 
-        print("\nEl boletín se enviará igualmente.\n")
+        print("\nNo se publica nada en este ciclo.\n")
+        return
 
     mensajes = format_report(informe)
 
     auto_published = 0
-    pending_reviews = 0
 
     for noticia, mensaje in zip(noticias, mensajes):
 
-        if noticia.score >= AUTO_PUBLISH_SCORE:
+        await publish_message(mensaje)
 
-            await publish_message(mensaje)
+        remember(
+            noticia,
+            "published"
+        )
 
-            remember(
-                noticia,
-                "published"
-            )
+        auto_published += 1
 
-            auto_published += 1
-
-            print(
-                f"🚀 Publicación automática ({noticia.score}/100): "
-                f"{noticia.title}"
-            )
-
-        else:
-
-            pending_id = add_pending(
-                news=noticia,
-                message=mensaje,
-            )
-
-            await send_review(
-                text=mensaje,
-                pending_id=pending_id,
-            )
-
-            pending_reviews += 1
+        print(
+            f"🚀 Publicado automáticamente ({noticia.market_impact}/100): "
+            f"{noticia.title}"
+        )
 
     total_time = time.perf_counter() - start
 
@@ -165,16 +188,15 @@ async def process_news():
     print(f"Telegram leídos:         {total_telegram}")
     print(f"Tras historial:          {total_after_history}")
     print(f"Tras limpieza:           {total_clean}")
-    print(f"Candidatas IA:           {total_candidates}")
+    print(f"Precandidatas mercado:   {total_precandidates}")
     print(f"Seleccionadas por IA:    {len(noticias)}")
     print(f"Publicadas auto:         {auto_published}")
-    print(f"Enviadas a redacción:    {pending_reviews}")
     print()
-    print(f"Tiempo RSS:              {rss_time:.2f}s")
+    print(f"Tiempo adquisición:      {acquisition_time:.2f}s")
     print(f"Tiempo clasificador:     {classifier_time:.2f}s")
-    print(f"Tiempo enricher IA:      {enricher_time:.2f}s")
-    print(f"Tiempo selector IA:      {selector_time:.2f}s")
     print(f"Tiempo descarga:         {download_time:.2f}s")
+    print(f"Tiempo enricher/verif:   {enricher_time:.2f}s")
+    print(f"Tiempo selector IA:      {selector_time:.2f}s")
     print(f"Tiempo writer IA:        {writer_time:.2f}s")
     print(f"Tiempo reviewer IA:      {reviewer_time:.2f}s")
     print(f"Tiempo total:            {total_time:.2f}s")

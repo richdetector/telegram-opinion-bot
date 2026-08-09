@@ -9,23 +9,36 @@ def format_one(news):
     else:
         icon = "🔴"
 
+    markets = news.get("affected_markets", [])
+    signals = news.get("signals", [])
+
+    if isinstance(markets, list):
+        markets = " · ".join(markets)
+
+    if isinstance(signals, list):
+        signals = "\n".join(f"- {signal}" for signal in signals[:5])
+
     return f"""*{news['title']}*
 
-🎯 *La clave*
-{news['key']}
-
-📰 *Qué ha pasado*
+*Qué ha pasado:*
 {news['what_happened']}
 
-🇪🇸 *Cómo afecta a España*
-{news['impact_spain']}
+*Por qué importa:*
+{news['why_it_matters']}
 
-👀 *Qué deberíamos vigilar*
+*Mercados:*
+{markets}
+
+*Señales:*
+{signals}
+
+*Lectura:*
+{news['reading']}
+
+*Qué vigilar:*
 {news['what_to_watch']}
 
-💬 *Análisis*
-{news['opinion']}
-
+*Estado:* {news['status']}
 {icon} *Confianza:* {news['confidence']}
 """
 

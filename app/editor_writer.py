@@ -3,7 +3,7 @@ import json
 
 from ai import ask_json
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "editor_writer.md"
+PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "market_writer.md"
 
 
 def write_news(news):
@@ -21,14 +21,53 @@ ID: {i}
 Categoría:
 {item.category}
 
+Tipo de evento:
+{item.event_type}
+
 Título:
 {item.title}
 
 Fuente:
 {item.source}
 
+Tipo de fuente:
+{item.source_type}
+
 Fecha:
 {item.published}
+
+Market impact:
+{item.market_impact}
+
+Materialidad:
+{item.materiality}
+
+Activos afectados:
+{", ".join(item.affected_assets)}
+
+Mecanismo:
+{item.mechanism}
+
+Estado:
+{item.verification_status}
+
+Confianza:
+{item.confidence}
+
+Señales:
+{", ".join(item.market_signals)}
+
+Discountedness:
+{item.discountedness}
+
+Expected:
+{item.expected}
+
+Actual:
+{item.actual}
+
+Surprise:
+{item.surprise}
 
 Contenido:
 
@@ -46,11 +85,13 @@ Contenido:
             {
                 "id": i,
                 "title": "",
-                "key": "",
                 "what_happened": "",
-                "impact_spain": "",
+                "why_it_matters": "",
+                "affected_markets": [],
+                "signals": [],
+                "reading": "",
                 "what_to_watch": "",
-                "opinion": "",
+                "status": "",
                 "confidence": ""
             }
         )

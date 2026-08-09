@@ -3,9 +3,13 @@ import trafilatura
 
 from feeds_fixed import RSS_FEEDS
 from models import NewsItem
+from sources_registry import apply_source_metadata
 
 
 MAX_CONTENT_LENGTH = 3000
+FEED_REQUEST_HEADERS = {
+    "User-Agent": "RadarMarketIntelligence/1.0 (+https://example.com; RSS health check)"
+}
 
 
 def extract_content(url):
@@ -52,7 +56,10 @@ def get_news(limit_per_feed=10):
 
     for feed_info in RSS_FEEDS:
 
-        feed = feedparser.parse(feed_info["url"])
+        feed = feedparser.parse(
+            feed_info["url"],
+            request_headers=FEED_REQUEST_HEADERS,
+        )
 
         for entry in feed.entries[:limit_per_feed]:
 
@@ -66,16 +73,16 @@ def get_news(limit_per_feed=10):
 
             seen_links.add(link)
 
-            news.append(
-                NewsItem(
-                    title=getattr(entry, "title", "").strip(),
-                    summary=getattr(entry, "summary", "").strip(),
-                    content="",
-                    link=link,
-                    published=getattr(entry, "published", "").strip(),
-                    source=feed_info["name"],
-                )
+            item = NewsItem(
+                title=getattr(entry, "title", "").strip(),
+                summary=getattr(entry, "summary", "").strip(),
+                content="",
+                link=link,
+                published=getattr(entry, "published", "").strip(),
+                source=feed_info["name"],
             )
+
+            news.append(apply_source_metadata(item))
 
     return news
 

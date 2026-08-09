@@ -3,19 +3,50 @@ import json
 
 from ai import ask_json
 from history import recent_history
+from market_scorer import can_reach_selection
+from verification import passes_publish_safety
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "editor_selector.md"
+PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "market_selector.md"
 
-MIN_SCORE = 80
+MIN_MARKET_IMPACT = 72
+MAX_SELECTED = 2
 
 
-def select_news_with_ai(news):
+def _fallback_select(news):
+    candidates = [
+        item
+        for item in news
+        if can_reach_selection(item)
+        and passes_publish_safety(item)
+    ]
 
-    # Solo llegan al selector noticias realmente importantes
-    news = [n for n in news if n.score >= MIN_SCORE]
+    candidates.sort(
+        key=lambda item: (
+            item.materiality == "CRITICAL",
+            item.market_impact,
+            item.source_reliability,
+            item.confluence_score,
+        ),
+        reverse=True,
+    )
+
+    return candidates[:MAX_SELECTED]
+
+
+def select_news_with_ai(news, use_ai=True):
+
+    news = [
+        n
+        for n in news
+        if n.market_impact >= MIN_MARKET_IMPACT
+        and can_reach_selection(n)
+    ]
 
     if len(news) == 0:
         return []
+
+    if not use_ai:
+        return _fallback_select(news)
 
     rules = PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -32,14 +63,41 @@ ID: {i}
 Categoría:
 {item.category}
 
+Tipo de evento:
+{item.event_type}
+
 Título:
 {item.title}
 
 Resumen:
 {item.summary}
 
-Score editorial:
-{item.score}
+Market impact score:
+{item.market_impact}
+
+Materialidad:
+{item.materiality}
+
+Activos afectados:
+{", ".join(item.affected_assets)}
+
+Clase de activo:
+{item.asset_class}
+
+Mecanismo:
+{item.mechanism}
+
+Estado de verificación:
+{item.verification_status}
+
+Confianza:
+{item.confidence}
+
+Señales:
+{", ".join(item.market_signals)}
+
+Fuentes relacionadas:
+{", ".join(item.related_sources)}
 
 Fuente:
 {item.source}
@@ -68,17 +126,17 @@ Estas son las noticias disponibles hoy.
 
 INSTRUCCIONES
 
-Solo selecciona noticias realmente excepcionales.
+Solo selecciona acontecimientos realmente excepcionales para mercados.
 
-No estás obligado a devolver tres noticias.
+No estás obligado a devolver ninguna noticia.
 
-Si hoy solo merece la pena publicar una, devuelve una.
+Puedes devolver 0, 1 o 2.
 
 Si ninguna merece la pena, devuelve una lista vacía.
 
 Evita repetir temas ya tratados recientemente salvo que exista un cambio realmente importante.
 
-Construye una portada variada y de alto impacto.
+Nunca selecciones más de dos.
 """
 
     data = ask_json(prompt)
@@ -88,9 +146,11 @@ Construye una portada variada y de alto impacto.
 
     selected_news = []
 
-    for news_id in data["selected_ids"]:
+    for news_id in data["selected_ids"][:MAX_SELECTED]:
 
         if 1 <= news_id <= len(news):
-            selected_news.append(news[news_id - 1])
+            item = news[news_id - 1]
+            if passes_publish_safety(item):
+                selected_news.append(item)
 
-    return selected_news
+    return selected_news[:MAX_SELECTED]

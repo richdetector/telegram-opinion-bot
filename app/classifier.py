@@ -128,6 +128,8 @@ def classify_news(news):
             score += hits * points
 
         item.category = category
-        item.score = score
+
+        if item.market_impact <= 0:
+            item.score = score
 
     return news

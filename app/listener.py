@@ -14,6 +14,13 @@ app.add_handler(
 )
 
 
-print("🎧 Escuchando botones...")
+def main():
 
-app.run_polling()
+    print("🎧 Escuchando botones...")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+
+    main()

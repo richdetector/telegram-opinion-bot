@@ -2,7 +2,7 @@ from pathlib import Path
 
 from ai import ask_json
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "editor_reviewer.md"
+PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "market_reviewer.md"
 
 
 def review_report(report, expected_news):

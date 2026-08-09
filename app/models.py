@@ -22,6 +22,34 @@ class NewsItem:
     language: str = ""
     duplicate: bool = False
 
+    event_type: str = "UNKNOWN"
+    affected_assets: list[str] = field(default_factory=list)
+    asset_class: str = "UNKNOWN"
+    market_impact: int = 0
+    impact_horizon: str = "UNKNOWN"
+    source_type: str = "BACKGROUND"
+    source_reliability: int = 40
+    source_speed: int = 40
+    is_rumor: bool = False
+    is_confirmed: bool = False
+    confidence: str = "Baja"
+    verification_status: str = "UNCONFIRMED"
+    primary_source: str = ""
+    related_sources: list[str] = field(default_factory=list)
+    geographic_scope: str = "UNKNOWN"
+    macro_driver: str = ""
+    crypto_asset: str = ""
+    materiality: str = "LOW"
+    mechanism: str = ""
+    market_signals: list[str] = field(default_factory=list)
+    intelligence_summary: dict = field(default_factory=dict)
+    discountedness: str = "UNKNOWN"
+    expected: str = ""
+    actual: str = ""
+    surprise: str = "UNKNOWN"
+    confluence_score: int = 0
+    evidence_level: str = "OBSERVED"
+
 
 @dataclass
 class NewsAnalysis:
