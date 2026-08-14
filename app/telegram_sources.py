@@ -3,8 +3,10 @@ CHANNELS = [
     "OSINTdefender",
     "Faytuks",
     "AnthropicAI",
-    "NVIDIAAI",
     "Bloomberg",
+    "NoticiasTradingCrypto",
+    "ultimominutoOTC",
+    "binancekillers",
 ]
 
 CHANNEL_METADATA = {
@@ -44,10 +46,10 @@ CHANNEL_METADATA = {
         "background": False,
     },
     "NVIDIAAI": {
-        "profile": "primary",
-        "high_reliability": True,
+        "profile": "inactive_unofficial",
+        "high_reliability": False,
         "fast": True,
-        "rumor_prone": False,
+        "rumor_prone": True,
         "background": False,
     },
     "FinancialTimes": {
@@ -62,6 +64,27 @@ CHANNEL_METADATA = {
         "high_reliability": True,
         "fast": True,
         "rumor_prone": False,
+        "background": False,
+    },
+    "NoticiasTradingCrypto": {
+        "profile": "fast",
+        "high_reliability": False,
+        "fast": True,
+        "rumor_prone": True,
+        "background": False,
+    },
+    "ultimominutoOTC": {
+        "profile": "fast",
+        "high_reliability": False,
+        "fast": True,
+        "rumor_prone": True,
+        "background": False,
+    },
+    "binancekillers": {
+        "profile": "fast",
+        "high_reliability": False,
+        "fast": True,
+        "rumor_prone": True,
         "background": False,
     },
 }

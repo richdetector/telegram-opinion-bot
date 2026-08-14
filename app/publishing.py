@@ -1,4 +1,4 @@
-from config import DRY_RUN
+from config import AUTO_PUBLISH_SHADOW, DRY_RUN
 from history import remember
 from telegram_bot import publish_message, send_review
 
@@ -12,6 +12,10 @@ async def safe_publish_message(text):
         raise DryRunPublishBlocked(
             "DRY_RUN=true blocks Telegram publication."
         )
+    if AUTO_PUBLISH_SHADOW:
+        raise DryRunPublishBlocked(
+            "AUTO_PUBLISH_SHADOW=true blocks Telegram publication."
+        )
 
     return await publish_message(text)
 
@@ -20,6 +24,10 @@ async def safe_send_review(*args, **kwargs):
     if DRY_RUN:
         raise DryRunPublishBlocked(
             "DRY_RUN=true blocks Telegram review messages."
+        )
+    if AUTO_PUBLISH_SHADOW:
+        raise DryRunPublishBlocked(
+            "AUTO_PUBLISH_SHADOW=true blocks Telegram review messages."
         )
 
     return await send_review(*args, **kwargs)

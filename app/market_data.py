@@ -58,6 +58,7 @@ class BtcEtfFlowSnapshot:
     btc_etf_flow_streak: int | None = None
     btc_etf_flow_timestamp: str = ""
     provider: str = "Blockworks ETF flows"
+    status: str = "UNKNOWN"
     errors: list[str] = field(default_factory=list)
 
 
@@ -88,6 +89,11 @@ class BtcOnchainSnapshot:
     btc_miner_to_exchange_zscore: float | None = None
     btc_onchain_timestamp: str = ""
     provider: str = "Glassnode"
+    status: str = "UNKNOWN"
+    btc_tx_count: float | None = None
+    btc_active_addresses: float | None = None
+    btc_hash_rate: float | None = None
+    coin_metrics_status: str = "UNKNOWN"
     large_transfers: list[LargeBtcTransfer] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -350,7 +356,7 @@ def fetch_btc_market_snapshot(client=None):
     except Exception as exc:
         snapshot.errors.append(f"funding:{type(exc).__name__}")
 
-    snapshot.liquidations_status = "UNAVAILABLE_PUBLIC_REST"
+    snapshot.liquidations_status = "UNAVAILABLE_FREE_SOURCE"
 
     return snapshot
 
@@ -421,13 +427,22 @@ def normalize_btc_etf_flows(rows):
 def fetch_btc_etf_flow_snapshot(client=None):
     client = client or BlockworksEtfFlowClient()
 
+    if isinstance(client, BlockworksEtfFlowClient) and not client.api_key:
+        return BtcEtfFlowSnapshot(
+            btc_etf_flow_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            status="NOT_CONFIGURED",
+        )
+
     try:
         rows = client.btc_etf_flows(limit_days=30)
-        return normalize_btc_etf_flows(rows)
+        snapshot = normalize_btc_etf_flows(rows)
+        snapshot.status = "OK" if not snapshot.errors else "API_ERROR"
+        return snapshot
     except Exception as exc:
         snapshot = BtcEtfFlowSnapshot(
             btc_etf_flow_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds")
         )
+        snapshot.status = "API_ERROR"
         snapshot.errors.append(f"etf_flows:{type(exc).__name__}")
         return snapshot
 
@@ -537,19 +552,65 @@ def fetch_btc_onchain_snapshot(client=None):
     client = client or GlassnodeOnchainClient()
 
     try:
-        metrics = {
-            "exchange_inflow": client.metric("/transactions/transfers_volume_to_exchanges_sum"),
-            "exchange_outflow": client.metric("/transactions/transfers_volume_from_exchanges_sum"),
-            "exchange_netflow": client.metric("/transactions/transfers_volume_exchanges_net"),
-            "exchange_reserves": client.metric("/distribution/balance_exchanges"),
-            "miner_to_exchange": client.metric("/transactions/transfers_volume_miners_to_exchanges"),
-            "whale_to_exchange": client.metric("/transactions/transfers_volume_whales_to_exchanges_sum"),
-            "exchange_to_whale": client.metric("/transactions/transfers_volume_exchanges_to_whales_sum"),
-        }
-        return normalize_btc_onchain_snapshot(metrics)
+        if isinstance(client, GlassnodeOnchainClient) and not client.api_key:
+            snapshot = BtcOnchainSnapshot(
+                btc_onchain_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                status="NOT_CONFIGURED",
+            )
+        else:
+            metrics = {
+                "exchange_inflow": client.metric("/transactions/transfers_volume_to_exchanges_sum"),
+                "exchange_outflow": client.metric("/transactions/transfers_volume_from_exchanges_sum"),
+                "exchange_netflow": client.metric("/transactions/transfers_volume_exchanges_net"),
+                "exchange_reserves": client.metric("/distribution/balance_exchanges"),
+                "miner_to_exchange": client.metric("/transactions/transfers_volume_miners_to_exchanges"),
+                "whale_to_exchange": client.metric("/transactions/transfers_volume_whales_to_exchanges_sum"),
+                "exchange_to_whale": client.metric("/transactions/transfers_volume_exchanges_to_whales_sum"),
+            }
+            snapshot = normalize_btc_onchain_snapshot(metrics)
+            snapshot.status = "OK" if not snapshot.errors else "API_ERROR"
+
+        coin_metrics = fetch_coin_metrics_context()
+        snapshot.btc_tx_count = coin_metrics.get("TxCnt")
+        snapshot.btc_active_addresses = coin_metrics.get("AdrActCnt")
+        snapshot.btc_hash_rate = coin_metrics.get("HashRate")
+        snapshot.coin_metrics_status = coin_metrics.get("status", "UNKNOWN")
+        return snapshot
     except Exception as exc:
         snapshot = BtcOnchainSnapshot(
             btc_onchain_timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds")
         )
+        snapshot.status = "API_ERROR"
         snapshot.errors.append(f"onchain:{type(exc).__name__}")
         return snapshot
+
+
+class CoinMetricsCommunityClient:
+
+    def __init__(self, base_url="https://community-api.coinmetrics.io/v4", timeout=10):
+        self.base_url = base_url
+        self.timeout = timeout
+
+    def asset_metrics(self, metrics="TxCnt,AdrActCnt,HashRate", limit_per_asset=2):
+        request = Request(
+            f"{self.base_url}/timeseries/asset-metrics?{urlencode({'assets': 'btc', 'metrics': metrics, 'frequency': '1d', 'page_size': limit_per_asset})}",
+            headers={"User-Agent": "RadarMarketIntelligence/1.0"},
+        )
+        with urlopen(request, timeout=self.timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_coin_metrics_context(client=None):
+    client = client or CoinMetricsCommunityClient()
+    try:
+        payload = client.asset_metrics()
+        rows = payload.get("data", [])
+        latest = rows[-1] if rows else {}
+        return {
+            "TxCnt": _safe_float(latest.get("TxCnt")),
+            "AdrActCnt": _safe_float(latest.get("AdrActCnt")),
+            "HashRate": _safe_float(latest.get("HashRate")),
+            "status": "OK" if latest else "UNAVAILABLE_FREE_SOURCE",
+        }
+    except Exception:
+        return {"status": "API_ERROR"}

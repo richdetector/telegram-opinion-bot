@@ -49,6 +49,13 @@ class NewsItem:
     surprise: str = "UNKNOWN"
     confluence_score: int = 0
     evidence_level: str = "OBSERVED"
+    mechanism_of_impact: str = "UNKNOWN"
+    editorial_quality: int = 0
+    final_decision: str = "PENDING"
+    final_reject_reasons: list[str] = field(default_factory=list)
+    declaration_status: str = "UNKNOWN"
+    rumor_score: int = 0
+    update_of: str = ""
 
 
 @dataclass

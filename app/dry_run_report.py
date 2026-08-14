@@ -28,6 +28,9 @@ def print_funnel_summary(funnel, discard_counters):
     print("========================================")
     print(f"Señales RSS:                 {funnel.get('rss', 0)}")
     print(f"Señales Telegram:            {funnel.get('telegram', 0)}")
+    print(f"Señales Reddit:              {funnel.get('reddit', 0)}")
+    print(f"Señales Truth Social:        {funnel.get('truth_social', 0)}")
+    print(f"Market state synthetic:      {funnel.get('market_state_signals', 0)}")
     print(f"Tras filtro:                 {funnel.get('after_filter', 0)}")
     print(f"Tras market scorer:          {funnel.get('after_market_scorer', 0)}")
     print(f"Precandidatas:               {funnel.get('precandidates', 0)}")
@@ -40,6 +43,36 @@ def print_funnel_summary(funnel, discard_counters):
     print()
     print("DESCARTES")
     print(format_discard_counters(discard_counters))
+    print()
+    print("REDDIT")
+    reddit_status = funnel.get("reddit_status")
+    if reddit_status is None:
+        print("REDDIT: UNKNOWN")
+    else:
+        print(f"Posts read:     {reddit_status.posts_read}")
+        print(f"Posts accepted: {reddit_status.posts_accepted}")
+        print(f"Top narratives: {_list_text(reddit_status.top_narratives)}")
+        print(f"Attention:      {reddit_status.attention}")
+        print(f"Sentiment:      {reddit_status.sentiment}")
+        print(f"Errors/status:  {reddit_status.status}")
+        if reddit_status.errors:
+            print(f"Errors detail:  {_list_text(reddit_status.errors)}")
+    print()
+    print("TRUTH SOCIAL")
+    truth_status = funnel.get("truth_social_status")
+    if truth_status is None:
+        print("TRUTH SOCIAL: UNKNOWN")
+    elif truth_status.status == "UNAVAILABLE_FREE_SOURCE":
+        print("TRUTH SOCIAL: UNAVAILABLE_FREE_SOURCE")
+        if truth_status.errors:
+            print(f"Errors: {_list_text(truth_status.errors)}")
+    else:
+        print(f"Status:                      {truth_status.status}")
+        print(f"Posts read:                  {truth_status.posts_read}")
+        print(f"Market-sensitive posts:      {truth_status.market_sensitive_posts}")
+        print(f"Latest relevant declaration: {truth_status.latest_relevant_declaration or 'None'}")
+        if truth_status.errors:
+            print(f"Errors:                      {_list_text(truth_status.errors)}")
     print("========================================\n")
 
 
@@ -82,7 +115,13 @@ def print_btc_market_state(state):
     print("ETF flows:")
     etf = state.etf_flows
     if etf is None or etf.btc_etf_net_flow is None:
-        print("ETF FLOWS: UNKNOWN")
+        status = getattr(etf, "status", "UNKNOWN") if etf else "UNKNOWN"
+        if status == "NOT_CONFIGURED":
+            print("ETF FLOWS: NOT_CONFIGURED")
+        elif status == "API_ERROR":
+            print("ETF FLOWS: API_ERROR")
+        else:
+            print("ETF FLOWS: UNKNOWN")
         if etf and etf.errors:
             print(f"ETF errors:      {_list_text(etf.errors)}")
     else:
@@ -118,7 +157,13 @@ def print_btc_market_state(state):
         and onchain.btc_exchange_reserves is None
         and onchain.btc_large_transfer_volume is None
     ):
-        print("ON-CHAIN: UNKNOWN")
+        status = getattr(onchain, "status", "UNKNOWN") if onchain else "UNKNOWN"
+        if status == "NOT_CONFIGURED":
+            print("ON-CHAIN: NOT_CONFIGURED")
+        elif status == "API_ERROR":
+            print("ON-CHAIN: API_ERROR")
+        else:
+            print("ON-CHAIN: UNKNOWN")
         if onchain and onchain.errors:
             print(f"On-chain errors: {_list_text(onchain.errors)}")
     else:
@@ -127,6 +172,12 @@ def print_btc_market_state(state):
         print(f"Netflow:           {_fmt(onchain.btc_exchange_netflow)}")
         print(f"Reserves:          {_fmt(onchain.btc_exchange_reserves)}")
         print(f"Whale activity:    {onchain.btc_whale_activity}")
+
+    if onchain and getattr(onchain, "coin_metrics_status", "UNKNOWN") != "UNKNOWN":
+        print(f"Coin Metrics:      {onchain.coin_metrics_status}")
+        print(f"BTC tx count:      {_fmt(onchain.btc_tx_count)}")
+        print(f"Active addresses:  {_fmt(onchain.btc_active_addresses)}")
+        print(f"Hash rate:         {_fmt(onchain.btc_hash_rate)}")
 
     print(f"On-chain regime: {state.onchain_regime}")
 
@@ -161,6 +212,9 @@ def print_btc_market_state(state):
         "RETAIL_EUPHORIA",
         "RETAIL_PANIC",
         "RETAIL_ATTENTION_SPIKE",
+        "REDDIT_ATTENTION_LOW",
+        "REDDIT_ATTENTION_ELEVATED",
+        "REDDIT_ATTENTION_EXTREME",
         "CROWDED_LONG",
         "CROWDED_SHORT",
         "POSITIVE_FLOW_NEGATIVE_RETAIL_DIVERGENCE",
@@ -269,6 +323,38 @@ def print_btc_market_state(state):
     print()
     print(f"Confluence:     {state.confluence}")
     print(f"Market regime:  {state.market_regime}")
+    print("========================================\n")
+
+
+def print_final_decision_gate(results):
+    print("\n========================================")
+    print("FINAL DECISION GATE")
+    print("========================================")
+
+    if not results:
+        print("No selected stories reached final gate.")
+        print("========================================\n")
+        return
+
+    for result in results:
+        item = result.item
+        print(f"{item.final_decision}: {item.title}")
+        print(f"Market impact:      {item.market_impact}")
+        print(f"Materiality:        {item.materiality}")
+        print(f"Verification:       {item.verification_status}")
+        print(f"Confidence:         {item.confidence}")
+        print(f"Mechanism strength: {getattr(result, 'mechanism_strength', getattr(item, 'mechanism_of_impact', 'UNKNOWN'))}")
+        print(f"Editorial quality:  {getattr(result, 'editorial_quality', getattr(item, 'editorial_quality', 0))}")
+        if getattr(item, "declaration_status", "UNKNOWN") != "UNKNOWN":
+            print(f"Declaration status: {item.declaration_status}")
+        if getattr(item, "rumor_score", 0):
+            print(f"Rumor score:        {item.rumor_score}")
+        if result.reasons:
+            print(f"FINAL_REJECT:       {_list_text(result.reasons)}")
+        else:
+            print("FINAL_REJECT:       None")
+        print("----------------------------------------")
+
     print("========================================\n")
 
 

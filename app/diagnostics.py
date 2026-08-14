@@ -14,6 +14,14 @@ DISCARD_REASONS = [
     "already_discounted",
     "selector_rejected",
     "reviewer_rejected",
+    "weak_mechanism",
+    "unverified",
+    "routine_content",
+    "weak_asset_link",
+    "frequency_limit",
+    "pre_candidate_low_rejected",
+    "pre_candidate_rumor_rejected",
+    "pre_candidate_medium_rejected",
 ]
 
 
@@ -51,6 +59,36 @@ def count_market_discards(news):
     for item in news:
         if not can_reach_selection(item):
             counters[market_discard_reason(item)] += 1
+
+    return counters
+
+
+def pre_candidate_reject_reason(item):
+    if item.materiality == "LOW":
+        return "pre_candidate_low_rejected"
+
+    if (
+        item.is_rumor
+        or item.verification_status == "RUMOR"
+        or item.declaration_status in {"THREATENED", "PROPOSED", "ANNOUNCED"}
+    ):
+        return "pre_candidate_rumor_rejected"
+
+    if item.materiality == "MEDIUM":
+        return "pre_candidate_medium_rejected"
+
+    return None
+
+
+def count_pre_candidate_rejections(news):
+    counters = Counter()
+
+    for item in news:
+        if can_reach_selection(item):
+            continue
+        reason = pre_candidate_reject_reason(item)
+        if reason:
+            counters[reason] += 1
 
     return counters
 

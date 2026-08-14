@@ -600,7 +600,53 @@ def score_market_news(news):
     return [score_market_item(item) for item in news]
 
 
+def pre_candidate_acceptance_reason(item):
+    if not can_reach_selection(item):
+        return ""
+
+    is_rumor = (
+        item.is_rumor
+        or item.verification_status == "RUMOR"
+        or item.declaration_status in {"THREATENED", "PROPOSED", "ANNOUNCED"}
+    )
+
+    if item.source == "MARKET_STATE":
+        return "MARKET_STATE_ANOMALY"
+    if is_rumor:
+        return "MATERIAL_RUMOR"
+    if item.materiality == "CRITICAL":
+        return "CRITICAL_EVENT"
+    if item.materiality == "HIGH":
+        return "HIGH_MATERIAL_EVENT"
+    if item.materiality == "MEDIUM":
+        return "EXCEPTIONAL_MEDIUM"
+
+    return ""
+
+
 def can_reach_selection(item):
+    if item.materiality == "LOW":
+        return False
+
+    is_rumor = (
+        item.is_rumor
+        or item.verification_status == "RUMOR"
+        or item.declaration_status in {"THREATENED", "PROPOSED", "ANNOUNCED"}
+    )
+
+    if is_rumor:
+        source_relevant = (
+            item.source_reliability >= 55
+            or item.source_type in {"PRIMARY", "HIGH_RELIABILITY"}
+            or item.source == "Truth Social @realDonaldTrump"
+        )
+        return (
+            item.market_impact >= 75
+            and item.materiality in {"HIGH", "CRITICAL"}
+            and source_relevant
+            and item.mechanism != "no clear material market transmission"
+        )
+
     if item.materiality in {"HIGH", "CRITICAL"}:
         return True
 

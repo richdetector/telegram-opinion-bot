@@ -35,7 +35,17 @@ SOURCE_REGISTRY = {
     "Faytuks": {"type": "FAST", "reliability": 60, "speed": 90, "rumor_prone": True},
     "OpenAI": {"type": "PRIMARY", "reliability": 80, "speed": 70},
     "AnthropicAI": {"type": "PRIMARY", "reliability": 80, "speed": 70},
-    "NVIDIAAI": {"type": "PRIMARY", "reliability": 80, "speed": 70},
+    "NVIDIAAI": {"type": "FAST", "reliability": 35, "speed": 70, "rumor_prone": True},
+    "NoticiasTradingCrypto": {"type": "FAST", "reliability": 35, "speed": 85, "rumor_prone": True},
+    "ultimominutoOTC": {"type": "FAST", "reliability": 35, "speed": 85, "rumor_prone": True},
+    "binancekillers": {"type": "FAST", "reliability": 30, "speed": 85, "rumor_prone": True},
+    "Truth Social @realDonaldTrump": {
+        "type": "FAST",
+        "reliability": 70,
+        "speed": 95,
+        "rumor_prone": True,
+        "market_sensitive": True,
+    },
 }
 
 BACKGROUND_SOURCES = {

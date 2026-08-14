@@ -138,6 +138,9 @@ def fetch_btc_sentiment_snapshot(client=None):
     snapshot = BtcSentimentSnapshot(sentiment_timestamp=_now())
     client = client or SantimentSentimentClient()
 
+    if isinstance(client, BtcSentimentSnapshot):
+        return client
+
     try:
         rows = client.btc_social_volume()
         values = []
@@ -160,6 +163,47 @@ def fetch_btc_sentiment_snapshot(client=None):
 
     except Exception as exc:
         snapshot.errors.append(f"sentiment:{type(exc).__name__}")
+
+    return snapshot
+
+
+def sentiment_from_reddit_status(status):
+    snapshot = BtcSentimentSnapshot(
+        sentiment_timestamp=_now(),
+        provider="Reddit Data API",
+    )
+
+    if status is None:
+        snapshot.errors.append("reddit:UNKNOWN")
+        return snapshot
+
+    if status.status != "OK":
+        snapshot.errors.append(f"reddit:{status.status}")
+
+    attention = (status.attention or "UNKNOWN").upper()
+    sentiment = (status.sentiment or "UNKNOWN").upper()
+
+    if attention in {"LOW", "ELEVATED", "EXTREME"}:
+        snapshot.retail_attention = "SPIKE" if attention in {"ELEVATED", "EXTREME"} else "NORMAL"
+        snapshot.retail_attention_score = {
+            "LOW": 30,
+            "ELEVATED": 65,
+            "EXTREME": 90,
+        }[attention]
+
+    if sentiment in {"BULLISH", "BEARISH", "EUPHORIC", "PANIC"}:
+        snapshot.retail_sentiment = "EUPHORIA" if sentiment == "EUPHORIC" else sentiment
+        snapshot.retail_sentiment_score = {
+            "BULLISH": 65,
+            "BEARISH": 35,
+            "EUPHORIC": 90,
+            "PANIC": 10,
+        }[sentiment]
+    elif status.posts_accepted:
+        snapshot.retail_sentiment = "UNKNOWN"
+
+    if status.top_narratives:
+        snapshot.narrative_state = ", ".join(status.top_narratives[:3])
 
     return snapshot
 
@@ -200,12 +244,26 @@ def _retail_signal(snapshot, signals):
     attention = (snapshot.retail_attention or "UNKNOWN").upper()
     attention_score = snapshot.retail_attention_score
     if attention == "SPIKE":
+        signal_name = "REDDIT_ATTENTION_EXTREME" if (
+            snapshot.provider == "Reddit Data API"
+            and attention_score is not None
+            and attention_score >= 85
+        ) else "REDDIT_ATTENTION_ELEVATED" if snapshot.provider == "Reddit Data API" else "RETAIL_ATTENTION_SPIKE"
         _add_signal(
             signals,
-            "RETAIL_ATTENTION_SPIKE",
+            signal_name,
             attention_score if attention_score is not None and attention_score <= 100 else 65,
             "CALCULATED",
             "Retail/social attention is elevated versus its recent baseline.",
+            timestamp,
+        )
+    elif attention == "NORMAL" and snapshot.provider == "Reddit Data API":
+        _add_signal(
+            signals,
+            "REDDIT_ATTENTION_LOW",
+            25,
+            "CALCULATED",
+            "Reddit attention is present but not elevated across accepted posts.",
             timestamp,
         )
 

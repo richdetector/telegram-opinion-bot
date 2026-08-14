@@ -106,6 +106,17 @@ La version actual no inventa datos de mercado. Si una senal no esta disponible e
 - Proveedores habituales: Glassnode, CryptoQuant, Coin Metrics, Arkham, Whale Alert.
 - Nota: varias fuentes son de pago o tienen limites severos.
 
+#### Coin Metrics Community API
+
+- Datos gratuitos usados: contexto BTC de actividad de red disponible en community endpoint, como `TxCnt`, `AdrActCnt` y `HashRate` cuando estan disponibles.
+- API: `https://community-api.coinmetrics.io/v4`.
+- API key: no necesaria para community endpoints.
+- Rate limits: 10 requests cada 6 segundos por IP en community tier.
+- Coste: gratuito bajo licencia community para usos permitidos.
+- Calidad: fuente robusta para metricas generales de red.
+- Limitaciones: no sustituye Glassnode/CryptoQuant para exchange inflows, exchange outflows, exchange reserves, whale-labelled flows, ETF flows ni wallet attribution.
+- Decision: integrado como contexto gratuito. Si una metrica no esta en la respuesta, queda `None`; Radar no inventa equivalencias.
+
 ### Whale intelligence
 
 - Datos necesarios: wallet labels, exchange/custodian/miner/ETF tags, direction, probable deposit/withdrawal/internal transfer.
@@ -197,13 +208,23 @@ La version actual no inventa datos de mercado. Si una senal no esta disponible e
 
 #### Reddit Data API
 
-- Datos: posts/comentarios por subreddit, intensidad de discusion, narrativa retail.
-- API: Reddit Data API con OAuth obligatorio.
-- Free tier/API key: clientes elegibles tienen 100 QPM por OAuth client id. Trafico no autenticado puede ser bloqueado.
-- Coste: gratuito para usos elegibles; Reddit puede requerir acuerdos para usos comerciales o mayores volumenes.
-- Calidad: buena para participacion retail/narrativas, debil para inferir posicionamiento real.
-- Limitaciones: requiere OAuth, User-Agent correcto y cumplimiento de terminos. No se debe usar RSS no autenticado como fuente robusta.
-- Decision: documentado, no activado todavia.
+- Datos: posts por subreddit, titulo, cuerpo/selftext, permalink, score, comentarios, `created_utc`, flair, autor y `upvote_ratio` cuando Reddit lo entrega.
+- Uso en Radar: senal temprana, deteccion de narrativas, retail attention, sentimiento agregado conservador y rumor discovery.
+- API: OAuth contra `https://www.reddit.com/api/v1/access_token` y lectura en `https://oauth.reddit.com`.
+- Free tier/API key: Reddit documenta 100 QPM por OAuth client id para uso gratuito elegible; trafico sin OAuth puede bloquearse.
+- Coste: gratuito para usos elegibles dentro de limites.
+- Calidad: buena para narrativa/retail attention; no confirma hechos de mercado.
+- Limitaciones: multiples posts Reddit no son confirmacion independiente. Reddit siempre entra como `COMMUNITY`, `rumor_prone=true`, `confidence=Baja` hasta que exista fuente externa fiable.
+- Decision: implementado via OAuth. Si faltan credenciales: `REDDIT: NOT_CONFIGURED`. No usar RSS Reddit.
+
+Crear una app Reddit gratis:
+
+1. Ir a `https://www.reddit.com/prefs/apps`.
+2. Elegir `are you a developer? create an app`.
+3. Crear una app de tipo `script` o `web app` para uso propio/backend.
+4. Copiar el client id y client secret.
+5. Definir un User-Agent descriptivo, por ejemplo `script:radar-market-intelligence:v1.0 (by /u/tu_usuario)`.
+6. Anadir en `.env` local, sin commitear: `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT`.
 
 #### The Tie
 

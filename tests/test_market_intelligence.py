@@ -16,18 +16,57 @@ from crypto_market_engine import (
     market_state_to_news_item,
 )
 from deduper import dedupe_news
+from diagnostics import count_pre_candidate_rejections
 from dry_run_report import print_dry_run_report
 from editor_selector import select_news_with_ai
 from liquidity_structure_engine import (
     BtcLiquidityStructureSnapshot,
     LiquidityCluster,
 )
-from market_scorer import score_market_item
+from main import _preselect_market_candidates, _revalidate_precandidates_after_download
+from market_scorer import can_reach_selection, score_market_item
 from market_data import BtcEtfFlowSnapshot, BtcMarketSnapshot
-from market_data import BtcOnchainSnapshot, LargeBtcTransfer, classify_large_transfer
+from market_data import (
+    BtcOnchainSnapshot,
+    BlockworksEtfFlowClient,
+    LargeBtcTransfer,
+    classify_large_transfer,
+    fetch_btc_etf_flow_snapshot,
+    fetch_coin_metrics_context,
+)
 from models import NewsItem
 from publishing import DryRunPublishBlocked
+from publication_gate import (
+    PublicationGateConfig,
+    apply_publication_gate,
+    evaluate_item,
+)
 from sentiment_engine import BtcSentimentSnapshot
+from rumor_gate import (
+    apply_rumor_gate,
+    evaluate_rumor_item,
+    event_update_type,
+    rumor_score,
+)
+from truth_social_reader import (
+    TruthSocialPost,
+    classify_declaration_status,
+    get_truth_social_news,
+    is_market_sensitive,
+    normalize_truth_social_status,
+    truth_post_to_news_item,
+)
+from reddit_reader import (
+    RedditStatus,
+    accept_reddit_post,
+    get_reddit_news,
+    normalize_reddit_post,
+    post_to_news_item,
+    summarize_reddit,
+)
+from sources_registry import apply_source_metadata, source_metadata
+from telegram_sources import CHANNELS, CHANNEL_METADATA
+from verification import verify_news
 
 
 def item(title, summary="", source="CNBC"):
@@ -39,6 +78,49 @@ def item(title, summary="", source="CNBC"):
         published="",
         source=source,
     )
+
+
+def publishable_item(title="SEC approves major spot Bitcoin ETF rule"):
+    news = item(
+        title,
+        "The decision directly affects spot Bitcoin ETF access, institutional demand, custody and BTC liquidity.",
+        source="SEC - Press Releases",
+    )
+    news.event_type = "CRYPTO_REGULATION"
+    news.affected_assets = ["BTC"]
+    news.asset_class = "CRYPTO"
+    news.market_impact = 84
+    news.score = 84
+    news.materiality = "HIGH"
+    news.confidence = "Alta"
+    news.verification_status = "CONFIRMED"
+    news.mechanism = "regulation/access -> institutional demand/liquidity -> BTC"
+    news.impact_horizon = "DAYS_WEEKS"
+    news.confluence_score = 45
+    news.surprise = "KNOWN"
+    return news
+
+
+def critical_trump_threat():
+    post = TruthSocialPost(
+        account="realDonaldTrump",
+        text="If China does not agree, I will impose 50% tariffs immediately.",
+        url="https://truthsocial.com/@realDonaldTrump/posts/1",
+        created_at="2026-08-14T12:00:00Z",
+        post_id="1",
+        raw_status="THREATENED",
+    )
+    news = truth_post_to_news_item(post)
+    news.event_type = "FISCAL_TRADE"
+    news.affected_assets = ["SP500", "NASDAQ", "EURUSD", "TREASURIES", "BTC"]
+    news.asset_class = "MACRO"
+    news.market_impact = 92
+    news.materiality = "CRITICAL"
+    news.mechanism = "tariffs -> inflation/growth expectations -> USD/yields/risk assets"
+    news.impact_horizon = "INTRADAY"
+    news.market_signals = ["policy declaration"]
+    news.confluence_score = 45
+    return news
 
 
 class MarketIntelligenceTests(unittest.TestCase):
@@ -1178,6 +1260,600 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertNotIn("institutions are manipulating", text)
         self.assertNotIn("smart money hunted stops", text)
         self.assertNotIn("manipulacion institucional", text)
+
+    def test_gate_high_pass_confirmed_direct_mechanism_is_publishable(self):
+        news = publishable_item()
+
+        result = evaluate_item(news, review_ok=True)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(news.final_decision, "PASS")
+        self.assertEqual(result.mechanism_strength, "DIRECT")
+
+    def test_gate_high_weak_indirect_mechanism_rejects(self):
+        news = publishable_item("Fed administrative update somehow affects BTC")
+        news.event_type = "UNKNOWN"
+        news.mechanism = "generic risk assets -> BTC"
+        news.affected_assets = ["BTC"]
+
+        result = evaluate_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("weak_mechanism", result.reasons)
+        self.assertIn("weak_asset_link", result.reasons)
+
+    def test_gate_critical_rumor_can_pass_only_when_config_allows(self):
+        news = publishable_item("Rumor: SEC emergency spot Bitcoin ETF decision")
+        news.market_impact = 94
+        news.materiality = "CRITICAL"
+        news.verification_status = "RUMOR"
+        news.confidence = "Media"
+        news.is_rumor = True
+
+        blocked = evaluate_item(
+            news,
+            review_ok=True,
+            config=PublicationGateConfig(allow_critical_rumor=False),
+        )
+        allowed = evaluate_item(
+            news,
+            review_ok=True,
+            config=PublicationGateConfig(allow_critical_rumor=True),
+        )
+
+        self.assertFalse(blocked.passed)
+        self.assertIn("unverified", blocked.reasons)
+        self.assertTrue(allowed.passed)
+
+    def test_gate_reviewer_fail_rejects(self):
+        result = evaluate_item(publishable_item(), review_ok=False)
+
+        self.assertFalse(result.passed)
+        self.assertIn("reviewer_failed", result.reasons)
+
+    def test_gate_duplicate_rejects(self):
+        news = publishable_item()
+        news.duplicate = True
+
+        result = evaluate_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("duplicate", result.reasons)
+
+    def test_gate_routine_primary_source_item_rejects(self):
+        news = publishable_item("ECB publishes consolidated banking data for end-March 2026")
+        news.summary = "Routine statistical release without abnormal stress or surprise."
+        news.source_type = "PRIMARY"
+        news.market_impact = 86
+        news.materiality = "HIGH"
+
+        result = evaluate_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("routine_content", result.reasons)
+
+    def test_gate_high_already_discounted_without_surprise_rejects(self):
+        news = publishable_item()
+        news.discountedness = "HIGH"
+        news.surprise = "UNKNOWN"
+
+        result = evaluate_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("already_discounted", result.reasons)
+
+    def test_gate_max_two_normal_publications(self):
+        items = [
+            publishable_item(f"SEC approves major spot Bitcoin ETF rule {i}")
+            for i in range(3)
+        ]
+        with patch("publication_gate._published_today_count", return_value=0):
+            publishable, results, _ = apply_publication_gate(
+                items,
+                {"ok": True, "errors": []},
+                PublicationGateConfig(max_per_cycle=2, max_per_day=10),
+            )
+
+        self.assertEqual(len(publishable), 2)
+        self.assertEqual(
+            sum("frequency_limit" in result.reasons for result in results),
+            1,
+        )
+
+    def test_gate_critical_not_duplicate_can_break_normal_limit(self):
+        normal = [
+            publishable_item(f"SEC approves major spot Bitcoin ETF rule {i}")
+            for i in range(2)
+        ]
+        critical = publishable_item("Federal Reserve unexpectedly hikes rates 50bp")
+        critical.event_type = "CENTRAL_BANK"
+        critical.affected_assets = ["TREASURIES", "EURUSD", "SP500", "NASDAQ", "BTC"]
+        critical.asset_class = "MACRO"
+        critical.market_impact = 95
+        critical.materiality = "CRITICAL"
+        critical.mechanism = "rates/yields/USD -> financial conditions -> risk assets"
+        critical.summary = "The unexpected hike reprices yields, USD and financial conditions."
+
+        with patch("publication_gate._published_today_count", return_value=0):
+            publishable, _, _ = apply_publication_gate(
+                normal + [critical],
+                {"ok": True, "errors": []},
+                PublicationGateConfig(max_per_cycle=2, max_per_day=2),
+            )
+
+        self.assertEqual(len(publishable), 3)
+        self.assertIn(critical, publishable)
+
+    def test_gate_low_never_publishes(self):
+        news = publishable_item("Bitcoin rises 0.4 percent with no catalyst")
+        news.market_impact = 20
+        news.materiality = "LOW"
+
+        result = evaluate_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("low_materiality", result.reasons)
+
+    def test_reddit_api_normalizes_posts(self):
+        raw = {
+            "data": {
+                "subreddit": "Bitcoin",
+                "title": "Bitcoin ETF flows accelerate after a macro catalyst",
+                "selftext": "Discussion of ETF demand and liquidity.",
+                "permalink": "/r/Bitcoin/comments/abc/test/",
+                "score": 120,
+                "num_comments": 45,
+                "created_utc": 1_800_000_000,
+                "link_flair_text": "Markets",
+                "author": "sample_user",
+                "upvote_ratio": 0.91,
+            }
+        }
+
+        post = normalize_reddit_post(raw)
+        news = post_to_news_item(post)
+
+        self.assertEqual(post.subreddit, "Bitcoin")
+        self.assertEqual(post.score, 120)
+        self.assertEqual(news.source, "r/Bitcoin")
+        self.assertEqual(news.source_type, "COMMUNITY")
+        self.assertTrue(news.is_rumor)
+
+    def test_reddit_credentials_absent_continues(self):
+        class NotConfiguredClient:
+            def configured(self):
+                return False
+
+        news, status = get_reddit_news(client=NotConfiguredClient())
+
+        self.assertEqual(news, [])
+        self.assertEqual(status.status, "NOT_CONFIGURED")
+
+    def test_reddit_429_is_safe_failure(self):
+        from urllib.error import HTTPError
+
+        class RateLimitedClient:
+            def configured(self):
+                return True
+
+            def subreddit_new(self, subreddit, limit=25):
+                raise HTTPError("url", 429, "Too Many Requests", None, None)
+
+        news, status = get_reddit_news(client=RateLimitedClient())
+
+        self.assertEqual(news, [])
+        self.assertEqual(status.status, "API_ERROR")
+        self.assertIn("r/Bitcoin:RATE_LIMIT", status.errors)
+
+    def test_reddit_rumor_only_is_not_confirmed(self):
+        reddit = apply_source_metadata(
+            item(
+                "Rumor: SEC may approve a strategic Bitcoin reserve",
+                "Unconfirmed Reddit discussion.",
+                source="r/Bitcoin",
+            )
+        )
+
+        verified = verify_news([reddit])[0]
+
+        self.assertEqual(verified.source_type, "COMMUNITY")
+        self.assertNotEqual(verified.verification_status, "CONFIRMED")
+
+    def test_reddit_plus_primary_source_can_raise_confidence(self):
+        reddit = apply_source_metadata(
+            item(
+                "SEC announces major spot Bitcoin ETF custody decision",
+                "Reddit discussion points to the same official event.",
+                source="r/Bitcoin",
+            )
+        )
+        primary = apply_source_metadata(
+            item(
+                "SEC announces major spot Bitcoin ETF custody decision",
+                "The SEC confirmed a decision affecting custody and ETF access.",
+                source="SEC - Press Releases",
+            )
+        )
+
+        verified = verify_news([reddit, primary])
+        reddit_verified = next(news for news in verified if news.source == "r/Bitcoin")
+
+        self.assertEqual(reddit_verified.verification_status, "CONFIRMED")
+        self.assertEqual(reddit_verified.confidence, "Alta")
+        self.assertEqual(reddit_verified.primary_source, "SEC - Press Releases")
+
+    def test_reddit_attention_spike_is_sentiment_signal_not_publication(self):
+        status = RedditStatus(
+            status="OK",
+            posts_read=30,
+            posts_accepted=18,
+            top_narratives=["BTC"],
+            attention="EXTREME",
+            sentiment="BULLISH",
+        )
+        from sentiment_engine import sentiment_from_reddit_status
+
+        state = analyze_btc_market_state(
+            BtcMarketSnapshot(),
+            None,
+            None,
+            sentiment_from_reddit_status(status),
+        )
+
+        self.assertIn("REDDIT_ATTENTION_EXTREME", [signal.name for signal in state.signals])
+        self.assertIsNone(market_state_to_news_item(state))
+
+    def test_multiple_reddit_posts_are_not_independent_confirmation(self):
+        one = apply_source_metadata(
+            item(
+                "Rumor: Treasury may announce Bitcoin reserve",
+                "A Reddit post says sources are circulating this rumor.",
+                source="r/Bitcoin",
+            )
+        )
+        two = apply_source_metadata(
+            item(
+                "Rumor: Treasury may announce Bitcoin reserve",
+                "Another Reddit discussion repeats the same rumor.",
+                source="r/CryptoCurrency",
+            )
+        )
+
+        verified = verify_news([one, two])
+
+        self.assertTrue(all(news.source_type == "COMMUNITY" for news in verified))
+        self.assertTrue(all(news.verification_status == "RUMOR" for news in verified))
+
+    def test_new_telegram_channels_are_rumor_prone(self):
+        for channel in ["NoticiasTradingCrypto", "ultimominutoOTC", "binancekillers"]:
+            self.assertIn(channel, CHANNELS)
+            self.assertTrue(CHANNEL_METADATA[channel]["rumor_prone"])
+            meta = source_metadata(channel)
+            self.assertEqual(meta["type"], "FAST")
+            self.assertTrue(meta["rumor_prone"])
+
+    def test_nvidiaai_is_not_primary_or_high_reliability(self):
+        self.assertNotIn("NVIDIAAI", CHANNELS)
+        meta = source_metadata("NVIDIAAI")
+
+        self.assertNotEqual(meta["type"], "PRIMARY")
+        self.assertLess(meta["reliability"], 80)
+
+    def test_unknown_reason_statuses_work(self):
+        etf = BtcEtfFlowSnapshot(status="NOT_CONFIGURED")
+        onchain = BtcOnchainSnapshot(status="UNAVAILABLE_FREE_SOURCE")
+
+        self.assertEqual(etf.status, "NOT_CONFIGURED")
+        self.assertEqual(onchain.status, "UNAVAILABLE_FREE_SOURCE")
+
+    def test_provider_not_configured_has_clean_status(self):
+        snapshot = fetch_btc_etf_flow_snapshot(
+            client=BlockworksEtfFlowClient(api_key="")
+        )
+
+        self.assertEqual(snapshot.status, "NOT_CONFIGURED")
+        self.assertEqual(snapshot.errors, [])
+
+    def test_coin_metrics_fallback_never_invents_unavailable_metrics(self):
+        class EmptyCoinMetricsClient:
+            def asset_metrics(self):
+                return {"data": [{"time": "2026-01-01T00:00:00Z", "TxCnt": "10"}]}
+
+        context = fetch_coin_metrics_context(EmptyCoinMetricsClient())
+
+        self.assertEqual(context["TxCnt"], 10.0)
+        self.assertIsNone(context["AdrActCnt"])
+        self.assertIsNone(context["HashRate"])
+        self.assertNotIn("exchange_inflow", context)
+        self.assertNotIn("whale", context)
+
+    def test_external_api_failure_keeps_reddit_alive(self):
+        class FailingClient:
+            def configured(self):
+                return True
+
+            def subreddit_new(self, subreddit, limit=25):
+                raise RuntimeError("api down")
+
+        news, status = get_reddit_news(client=FailingClient())
+
+        self.assertEqual(news, [])
+        self.assertEqual(status.status, "API_ERROR")
+
+    def test_selector_still_zero_to_two_after_reddit_phase(self):
+        items = [
+            score_market_item(
+                item(
+                    f"SEC announces major spot Bitcoin ETF custody decision {i}",
+                    "The decision affects ETF flows, custody, institutional access and BTC liquidity.",
+                    source="SEC - Press Releases",
+                )
+            )
+            for i in range(5)
+        ]
+
+        selected = select_news_with_ai(items, use_ai=False)
+
+        self.assertLessEqual(len(selected), 2)
+
+    def test_publication_gate_thresholds_unchanged_after_reddit_phase(self):
+        news = publishable_item()
+        result = evaluate_item(news, review_ok=True)
+
+        self.assertTrue(result.passed)
+        self.assertGreaterEqual(news.market_impact, 65)
+        self.assertIn(news.materiality, {"HIGH", "CRITICAL"})
+
+    def test_trump_tariff_threat_is_threatened_and_market_sensitive(self):
+        text = "If China does not accept, I will impose tariffs of 50%."
+
+        self.assertTrue(is_market_sensitive(text))
+        self.assertEqual(classify_declaration_status(text), "THREATENED")
+
+    def test_trump_direct_declaration_confirms_declaration_not_implementation(self):
+        raw = {
+            "id": "123",
+            "content": "<p>I will impose 50% tariffs on China unless talks improve.</p>",
+            "url": "https://truthsocial.com/@realDonaldTrump/posts/123",
+            "created_at": "2026-08-14T12:00:00Z",
+        }
+        post = normalize_truth_social_status(raw)
+        news = truth_post_to_news_item(post)
+
+        self.assertEqual(news.declaration_status, "THREATENED")
+        self.assertTrue(news.intelligence_summary["truth_social"]["confirmed_declaration"])
+        self.assertFalse(news.intelligence_summary["truth_social"]["policy_implemented"])
+
+    def test_minor_trump_post_is_irrelevant(self):
+        text = "Great crowd today. Thank you everyone!"
+
+        self.assertFalse(is_market_sensitive(text))
+        self.assertEqual(classify_declaration_status(text), "UNKNOWN")
+
+    def test_critical_trump_declaration_can_reach_rumor_gate(self):
+        result = evaluate_rumor_item(critical_trump_threat(), review_ok=True)
+
+        self.assertTrue(result.passed)
+        self.assertGreaterEqual(result.rumor_score, 70)
+
+    def test_weak_rumor_rejects(self):
+        news = item(
+            "Random account says oil may move tomorrow",
+            "No traceable source or mechanism.",
+            source="Unknown Blog",
+        )
+        news.market_impact = 86
+        news.materiality = "HIGH"
+        news.verification_status = "RUMOR"
+        news.affected_assets = ["OIL"]
+        news.mechanism = ""
+
+        result = evaluate_rumor_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("weak_source", result.reasons)
+        self.assertIn("weak_mechanism", result.reasons)
+
+    def test_critical_rumor_from_relevant_source_can_pass(self):
+        news = critical_trump_threat()
+        news.verification_status = "THREATENED"
+
+        result = evaluate_rumor_item(news, review_ok=True)
+
+        self.assertTrue(result.passed)
+
+    def test_telegram_only_low_relevance_rumor_rejects(self):
+        news = item(
+            "Rumor: small exchange may list a token",
+            "Telegram-only rumor with no material market mechanism.",
+            source="binancekillers",
+        )
+        news = apply_source_metadata(news)
+        news.market_impact = 50
+        news.materiality = "MEDIUM"
+        news.verification_status = "RUMOR"
+        news.affected_assets = ["BTC"]
+        news.mechanism = "generic crypto sentiment -> BTC"
+
+        result = evaluate_rumor_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("low_market_impact", result.reasons)
+
+    def test_multiple_independent_fast_sources_improve_rumor_score(self):
+        one = critical_trump_threat()
+        one.related_sources = []
+        one.materiality = "HIGH"
+        one.market_impact = 85
+        one.market_signals = []
+        two = critical_trump_threat()
+        two.related_sources = ["ClashReport", "OSINTdefender"]
+        two.materiality = "HIGH"
+        two.market_impact = 85
+        two.market_signals = []
+
+        self.assertGreater(rumor_score(two), rumor_score(one))
+
+    def test_market_reaction_does_not_confirm_rumor(self):
+        news = critical_trump_threat()
+        news.market_signals = ["oil +4%", "volatility spike"]
+        news.verification_status = "RUMOR"
+
+        evaluate_rumor_item(news, review_ok=True)
+
+        self.assertEqual(news.verification_status, "RUMOR")
+        self.assertNotEqual(news.confidence, "Alta")
+
+    def test_rumor_contradicted_is_denied(self):
+        news = critical_trump_threat()
+        news.declaration_status = "DENIED"
+        news.verification_status = "DENIED"
+
+        result = evaluate_rumor_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("denied", result.reasons)
+
+    def test_rumor_later_confirmed_update_existing_event(self):
+        self.assertEqual(event_update_type("RUMOR", "CONFIRMED"), "CONFIRMED")
+        self.assertEqual(event_update_type("THREATENED", "IMPLEMENTED"), "IMPLEMENTED")
+        self.assertEqual(event_update_type("RUMOR", "DENIED"), "DENIED")
+
+    def test_statement_about_policy_is_announced_not_implemented(self):
+        text = "I am announcing new tariffs on semiconductors next month."
+
+        self.assertEqual(classify_declaration_status(text), "ANNOUNCED")
+        self.assertNotEqual(classify_declaration_status(text), "IMPLEMENTED")
+
+    def test_truth_social_unavailable_keeps_radar_running(self):
+        news, status = get_truth_social_news()
+
+        self.assertEqual(news, [])
+        self.assertEqual(status.status, "UNAVAILABLE_FREE_SOURCE")
+
+    def test_rumor_reviewer_fail_never_publishes(self):
+        result = evaluate_rumor_item(critical_trump_threat(), review_ok=False)
+
+        self.assertFalse(result.passed)
+        self.assertIn("reviewer_failed", result.reasons)
+
+    def test_rumor_gate_no_buy_sell_language(self):
+        news = critical_trump_threat()
+        result = evaluate_rumor_item(news, review_ok=True)
+        text = f"{news.title} {news.summary} {news.mechanism} {' '.join(news.market_signals)}".lower()
+
+        self.assertTrue(result.passed)
+        self.assertNotIn("buy", text)
+        self.assertNotIn("sell", text)
+        self.assertNotIn("compra", text)
+        self.assertNotIn("vende", text)
+
+    def test_precandidate_low_score_15_never_reaches_enrichment(self):
+        news = item("Crypto Biz: Bitcoin self-custody wake-up call")
+        news.market_impact = 15
+        news.materiality = "LOW"
+        news.verification_status = "PRELIMINARY"
+        news.mechanism = "no clear material market transmission"
+
+        self.assertFalse(can_reach_selection(news))
+
+    def test_precandidate_low_rumor_never_reaches_enrichment(self):
+        news = item("Rumor: Bitcoin self-custody story", source="Cointelegraph")
+        news.market_impact = 15
+        news.materiality = "LOW"
+        news.is_rumor = True
+        news.verification_status = "RUMOR"
+        news.mechanism = "positioning/liquidity -> volatility risk -> BTC/ETH"
+        news.affected_assets = ["BTC"]
+
+        self.assertFalse(can_reach_selection(news))
+
+    def test_precandidate_low_rumor_legacy_score_high_never_reaches_enrichment(self):
+        news = item("Crypto Biz: Bitcoin self-custody wake-up call", source="Cointelegraph")
+        news.score = 99
+        news.market_impact = 15
+        news.materiality = "LOW"
+        news.is_rumor = True
+        news.verification_status = "RUMOR"
+        news.mechanism = "positioning/liquidity -> volatility risk -> BTC/ETH"
+        news.affected_assets = ["BTC"]
+
+        self.assertFalse(can_reach_selection(news))
+        self.assertEqual(_preselect_market_candidates([news]), [])
+
+    def test_precandidate_weak_rumor_score_40_never_reaches_enrichment(self):
+        news = item("Rumor: weak crypto market story", source="binancekillers")
+        news = apply_source_metadata(news)
+        news.market_impact = 40
+        news.materiality = "MEDIUM"
+        news.is_rumor = True
+        news.verification_status = "RUMOR"
+        news.mechanism = "positioning/liquidity -> volatility risk -> BTC/ETH"
+        news.affected_assets = ["BTC"]
+
+        self.assertFalse(can_reach_selection(news))
+
+    def test_precandidate_material_rumor_score_75_can_reach_enrichment(self):
+        news = item("Trump threatens 50% tariffs on China", source="Truth Social @realDonaldTrump")
+        news = apply_source_metadata(news)
+        news.market_impact = 75
+        news.materiality = "HIGH"
+        news.is_rumor = True
+        news.verification_status = "RUMOR"
+        news.declaration_status = "THREATENED"
+        news.mechanism = "tariffs -> inflation/growth expectations -> USD/yields/risk assets"
+        news.affected_assets = ["SP500", "NASDAQ", "TREASURIES", "EURUSD", "BTC"]
+
+        self.assertTrue(can_reach_selection(news))
+
+    def test_precandidate_high_confirmed_reaches_enrichment(self):
+        news = publishable_item()
+
+        self.assertTrue(can_reach_selection(news))
+
+    def test_post_download_low_candidate_is_removed_before_ai_enrichment(self):
+        news = publishable_item("SEC approves major spot Bitcoin ETF rule")
+        self.assertTrue(can_reach_selection(news))
+
+        news.market_impact = 15
+        news.score = 15
+        news.materiality = "LOW"
+        news.verification_status = "RUMOR"
+        news.is_rumor = True
+
+        self.assertEqual(_revalidate_precandidates_after_download([news]), [])
+
+    def test_precandidate_change_does_not_change_final_publication_rules(self):
+        low = publishable_item("Bitcoin rises 0.4 percent with no catalyst")
+        low.market_impact = 15
+        low.materiality = "LOW"
+
+        result = evaluate_item(low, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("low_materiality", result.reasons)
+
+    def test_precandidate_rejection_counters(self):
+        low = item("Low impact item")
+        low.market_impact = 15
+        low.materiality = "LOW"
+
+        medium = item("Medium item")
+        medium.market_impact = 50
+        medium.materiality = "MEDIUM"
+
+        rumor = item("Weak rumor", source="binancekillers")
+        rumor = apply_source_metadata(rumor)
+        rumor.market_impact = 40
+        rumor.materiality = "MEDIUM"
+        rumor.verification_status = "RUMOR"
+        rumor.is_rumor = True
+
+        counters = count_pre_candidate_rejections([low, medium, rumor])
+
+        self.assertEqual(counters["pre_candidate_low_rejected"], 1)
+        self.assertEqual(counters["pre_candidate_medium_rejected"], 1)
+        self.assertEqual(counters["pre_candidate_rumor_rejected"], 1)
 
 
 if __name__ == "__main__":
