@@ -19,7 +19,16 @@ from editor_selector import select_news_with_ai
 from editor_writer import write_news
 from editor_reviewer import review_report
 
-from config import AUTO_PUBLISH_SHADOW, DRY_RUN
+from config import (
+    ARTICLE_TIMEOUT_SECONDS,
+    AUTO_PUBLISH_SHADOW,
+    DRY_RUN,
+    MARKET_DATA_TIMEOUT_SECONDS,
+    OPENAI_TIMEOUT_SECONDS,
+    QUIET_MARKET_ENABLED,
+    RSS_TIMEOUT_SECONDS,
+    TELEGRAM_TIMEOUT_SECONDS,
+)
 from crypto_market_engine import fetch_btc_market_state, market_state_to_news_item
 from diagnostics import (
     count_market_discards,
@@ -36,8 +45,16 @@ from dry_run_report import (
 from formatter import format_report
 from publication_gate import apply_publication_gate
 from publishing import publish_selected
+from quiet_market import evaluate_quiet_market, quiet_market_fingerprint
 from reddit_reader import get_reddit_news
 from rumor_gate import apply_rumor_gate
+from runtime_guards import (
+    empty_network_counter,
+    log_checkpoint,
+    run_async_phase,
+    run_sync_phase,
+)
+from seen_cache import SeenCache
 from sentiment_engine import sentiment_from_reddit_status
 from truth_social_reader import get_truth_social_news
 from history import was_sent
@@ -107,29 +124,106 @@ def _revalidate_precandidates_after_download(news):
     ]
 
 
+async def _handle_quiet_market(funnel, btc_market_state, has_market_alert=False):
+    seen_cache = funnel.get("seen_cache")
+    decision = evaluate_quiet_market(
+        btc_market_state,
+        has_market_alert=has_market_alert,
+        seen_cache=seen_cache,
+    )
+    funnel["quiet_market"] = decision
+
+    if not decision.passed:
+        return 0
+
+    if DRY_RUN or AUTO_PUBLISH_SHADOW:
+        print("\n==============================")
+        print("QUIET MARKET NOTE CANDIDATE")
+        print("==============================")
+        print(decision.message)
+        print("==============================\n")
+        return 0
+
+    published = await publish_selected([decision.note], [decision.message])
+    decision.published = bool(published)
+    if decision.published and seen_cache:
+        seen_cache.remember_quiet_market(
+            quiet_market_fingerprint(btc_market_state),
+            published=True,
+        )
+    return published
+
+
 async def process_news():
 
     start = time.perf_counter()
     funnel = {}
     discard_counters = empty_discard_counter()
+    network_counters = empty_network_counter()
+    seen_cache = SeenCache()
 
     acquisition_start = time.perf_counter()
 
-    rss_news = get_news(limit_per_feed=RSS_LIMIT_PER_FEED)
-    telegram_news = await get_telegram_news(limit=TELEGRAM_LIMIT_PER_CHANNEL)
-    reddit_news, reddit_status = get_reddit_news()
-    truth_news, truth_status = get_truth_social_news()
-    market_state_enabled = DRY_RUN or AUTO_PUBLISH_SHADOW
+    log_checkpoint("[cycle] START process_news")
+
+    rss_news = await run_sync_phase(
+        "RSS",
+        lambda: get_news(
+            limit_per_feed=RSS_LIMIT_PER_FEED,
+            diagnostics=network_counters,
+            seen_cache=seen_cache,
+        ),
+        timeout=RSS_TIMEOUT_SECONDS,
+        fallback=[],
+        counters=network_counters,
+        timeout_counter="rss_timeout",
+    )
+    telegram_news = await run_async_phase(
+        "TELEGRAM",
+        lambda: get_telegram_news(
+            limit=TELEGRAM_LIMIT_PER_CHANNEL,
+            diagnostics=network_counters,
+            seen_cache=seen_cache,
+        ),
+        timeout=TELEGRAM_TIMEOUT_SECONDS,
+        fallback=[],
+        counters=network_counters,
+        timeout_counter="telegram_timeout",
+    )
+    reddit_news, reddit_status = await run_sync_phase(
+        "REDDIT",
+        lambda: get_reddit_news(),
+        timeout=MARKET_DATA_TIMEOUT_SECONDS,
+        fallback=([], None),
+        counters=network_counters,
+        timeout_counter="market_data_timeout",
+    )
+    truth_news, truth_status = await run_sync_phase(
+        "TRUTH SOCIAL",
+        lambda: get_truth_social_news(),
+        timeout=MARKET_DATA_TIMEOUT_SECONDS,
+        fallback=([], None),
+        counters=network_counters,
+        timeout_counter="market_data_timeout",
+    )
+    market_state_enabled = DRY_RUN or AUTO_PUBLISH_SHADOW or QUIET_MARKET_ENABLED
     btc_market_state = (
-        fetch_btc_market_state(
-            sentiment_fetcher=lambda: sentiment_from_reddit_status(reddit_status)
+        await run_sync_phase(
+            "MARKET DATA",
+            lambda: fetch_btc_market_state(
+                sentiment_fetcher=lambda: sentiment_from_reddit_status(reddit_status)
+            ),
+            timeout=MARKET_DATA_TIMEOUT_SECONDS,
+            fallback=None,
+            counters=network_counters,
+            timeout_counter="market_data_timeout",
         )
         if market_state_enabled
         else None
     )
     market_state_news = (
         [market_state_to_news_item(btc_market_state)]
-        if market_state_enabled
+        if market_state_enabled and btc_market_state is not None
         else []
     )
     market_state_news = [
@@ -137,8 +231,16 @@ async def process_news():
         for item in market_state_news
         if item is not None
     ]
+    if (
+        btc_market_state is not None
+        and btc_market_state.onchain is not None
+        and "coinmetrics_timeout" in btc_market_state.onchain.errors
+    ):
+        network_counters["coinmetrics_timeout"] += 1
     noticias = rss_news + telegram_news + reddit_news + truth_news
     noticias.extend(market_state_news)
+    collected_total = len(noticias)
+    noticias, intake_stats = seen_cache.filter_new_items(noticias)
 
     acquisition_time = time.perf_counter() - acquisition_start
 
@@ -151,7 +253,13 @@ async def process_news():
     funnel["market_state_signals"] = len(market_state_news)
     funnel["reddit_status"] = reddit_status
     funnel["truth_social_status"] = truth_status
+    funnel["network_counters"] = network_counters
+    funnel["intake_stats"] = intake_stats
+    funnel["source_performance"] = seen_cache.source_performance()
+    funnel["seen_cache"] = seen_cache
+    funnel["collected_total"] = collected_total
 
+    log_checkpoint("[phase] HISTORY/FILTER START")
     noticias = [
         n
         for n in noticias
@@ -164,18 +272,25 @@ async def process_news():
     noticias = clean_news(noticias)
     total_clean = len(noticias)
     funnel["after_filter"] = total_clean
+    log_checkpoint("[phase] HISTORY/FILTER DONE")
 
     classifier_start = time.perf_counter()
+    log_checkpoint("[phase] CLASSIFIER START")
     noticias = classify_news(noticias)
     noticias = score_market_news(noticias)
     classifier_time = time.perf_counter() - classifier_start
+    log_checkpoint(f"[phase] CLASSIFIER DONE duration={classifier_time:.2f}s")
     funnel["after_market_scorer"] = len(noticias)
     discard_counters.update(count_market_discards(noticias))
     discard_counters.update(count_pre_candidate_rejections(noticias))
+    for item in noticias:
+        if not can_reach_selection(item):
+            seen_cache.update_item_status(item, "DISCARDED")
 
     noticias = _preselect_market_candidates(noticias)
     total_precandidates = len(noticias)
     funnel["precandidates"] = total_precandidates
+    seen_cache.mark_precandidates(noticias)
     _print_pre_candidates(noticias)
 
     if not noticias:
@@ -185,14 +300,23 @@ async def process_news():
         funnel["selected"] = 0
         funnel["reviewer_pass"] = False
         funnel["would_publish"] = 0
+        await _handle_quiet_market(funnel, btc_market_state)
         print_funnel_summary(funnel, discard_counters)
         if market_state_enabled:
             print_btc_market_state(btc_market_state)
         print("\nRADAR: NO MATERIAL EVENTS\n")
+        log_checkpoint("[cycle] DONE process_news")
         return
 
     download_start = time.perf_counter()
-    noticias = enrich_news(noticias)
+    noticias = await run_sync_phase(
+        "ARTICLE DOWNLOAD",
+        lambda: enrich_news(noticias, diagnostics=network_counters),
+        timeout=min(ARTICLE_TIMEOUT_SECONDS * max(1, len(noticias)), 60),
+        fallback=[],
+        counters=network_counters,
+        timeout_counter="article_timeout",
+    )
     noticias = score_market_news(noticias)
     noticias = _revalidate_precandidates_after_download(noticias)
     download_time = time.perf_counter() - download_start
@@ -204,14 +328,23 @@ async def process_news():
         funnel["selected"] = 0
         funnel["reviewer_pass"] = False
         funnel["would_publish"] = 0
+        await _handle_quiet_market(funnel, btc_market_state)
         print_funnel_summary(funnel, discard_counters)
         if market_state_enabled:
             print_btc_market_state(btc_market_state)
-        print_dry_run_report([], [])
+        print_dry_run_report([], [], dry_run=DRY_RUN, shadow=AUTO_PUBLISH_SHADOW)
+        log_checkpoint("[cycle] DONE process_news")
         return
 
     enricher_start = time.perf_counter()
-    noticias = enrich_metadata(noticias)
+    noticias = await run_sync_phase(
+        "AI ENRICHMENT",
+        lambda: enrich_metadata(noticias),
+        timeout=OPENAI_TIMEOUT_SECONDS,
+        fallback=[],
+        counters=network_counters,
+        timeout_counter="openai_timeout",
+    )
     funnel["after_enrichment"] = len(noticias)
     noticias = score_market_news(noticias)
     noticias = verify_news(noticias)
@@ -248,10 +381,18 @@ async def process_news():
 
     selector_start = time.perf_counter()
     selector_input = list(noticias)
-    noticias = select_news_with_ai(noticias)
+    noticias = await run_sync_phase(
+        "SELECTOR",
+        lambda: select_news_with_ai(noticias),
+        timeout=OPENAI_TIMEOUT_SECONDS,
+        fallback=[],
+        counters=network_counters,
+        timeout_counter="openai_timeout",
+    )
     noticias = noticias[:MAX_PUBLICATIONS]
     selector_time = time.perf_counter() - selector_start
     funnel["selected"] = len(noticias)
+    seen_cache.mark_selected(noticias)
     discard_counters["selector_rejected"] += count_selector_rejections(
         selector_input,
         noticias,
@@ -282,19 +423,46 @@ async def process_news():
     if not noticias:
         funnel["reviewer_pass"] = False
         funnel["would_publish"] = 0
+        await _handle_quiet_market(funnel, btc_market_state, has_market_alert=True)
         print_funnel_summary(funnel, discard_counters)
         print_final_decision_gate(pre_gate_results)
         if market_state_enabled:
             print_btc_market_state(btc_market_state)
-        print_dry_run_report([], [])
+        print_dry_run_report([], [], dry_run=DRY_RUN, shadow=AUTO_PUBLISH_SHADOW)
+        log_checkpoint("[cycle] DONE process_news")
         return
 
     writer_start = time.perf_counter()
-    informe = write_news(noticias)
+    informe = await run_sync_phase(
+        "WRITER",
+        lambda: write_news(noticias),
+        timeout=OPENAI_TIMEOUT_SECONDS,
+        fallback=None,
+        counters=network_counters,
+        timeout_counter="openai_timeout",
+    )
     writer_time = time.perf_counter() - writer_start
 
+    if informe is None:
+        funnel["reviewer_pass"] = False
+        funnel["would_publish"] = 0
+        await _handle_quiet_market(funnel, btc_market_state, has_market_alert=True)
+        print_funnel_summary(funnel, discard_counters)
+        if market_state_enabled:
+            print_btc_market_state(btc_market_state)
+        print_dry_run_report([], [], dry_run=DRY_RUN, shadow=AUTO_PUBLISH_SHADOW)
+        log_checkpoint("[cycle] DONE process_news")
+        return
+
     reviewer_start = time.perf_counter()
-    revision = review_report(informe, len(noticias))
+    revision = await run_sync_phase(
+        "REVIEWER",
+        lambda: review_report(informe, len(noticias)),
+        timeout=OPENAI_TIMEOUT_SECONDS,
+        fallback={"ok": False, "errors": ["openai_timeout"]},
+        counters=network_counters,
+        timeout_counter="openai_timeout",
+    )
     reviewer_time = time.perf_counter() - reviewer_start
     reviewer_pass = bool(revision.get("ok"))
     funnel["reviewer_pass"] = reviewer_pass
@@ -330,11 +498,13 @@ async def process_news():
             print("-", error)
 
         print("\nNo se publica nada en este ciclo.\n")
+        await _handle_quiet_market(funnel, btc_market_state, has_market_alert=True)
         print_funnel_summary(funnel, discard_counters)
         print_final_decision_gate(final_gate_results)
         if market_state_enabled:
             print_btc_market_state(btc_market_state)
-        print_dry_run_report([], [])
+        print_dry_run_report([], [], dry_run=DRY_RUN, shadow=AUTO_PUBLISH_SHADOW)
+        log_checkpoint("[cycle] DONE process_news")
         return
 
     noticias = publishable
@@ -346,10 +516,24 @@ async def process_news():
         print_funnel_summary(funnel, discard_counters)
         print_final_decision_gate(final_gate_results)
         print_btc_market_state(btc_market_state)
-        print_dry_run_report(noticias, mensajes)
+        print_dry_run_report(
+            noticias,
+            mensajes,
+            dry_run=DRY_RUN,
+            shadow=AUTO_PUBLISH_SHADOW,
+        )
+        log_checkpoint("[cycle] DONE process_news")
         return
 
-    auto_published = await publish_selected(noticias, mensajes)
+    auto_published = await run_async_phase(
+        "PUBLISHER",
+        lambda: publish_selected(noticias, mensajes),
+        timeout=TELEGRAM_TIMEOUT_SECONDS,
+        fallback=0,
+        counters=network_counters,
+        timeout_counter="telegram_timeout",
+    )
+    seen_cache.mark_published(noticias)
 
     total_time = time.perf_counter() - start
 
@@ -373,6 +557,7 @@ async def process_news():
     print(f"Tiempo reviewer IA:      {reviewer_time:.2f}s")
     print(f"Tiempo total:            {total_time:.2f}s")
     print("==============================\n")
+    log_checkpoint("[cycle] DONE process_news")
 
 
 async def main():

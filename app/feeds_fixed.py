@@ -39,10 +39,34 @@ RSS_FEEDS = [
         "weight": 26,
     },
     {
+        "name": "BEA - News Releases",
+        "url": "https://apps.bea.gov/rss/rss.xml",
+        "category": "macro",
+        "weight": 28,
+        "tier": "PRIMARY",
+        "priority": "CRITICAL",
+    },
+    {
+        "name": "Census - Economic Indicators",
+        "url": "https://www.census.gov/economic-indicators/indicator.xml",
+        "category": "macro",
+        "weight": 24,
+        "tier": "PRIMARY",
+        "priority": "HIGH",
+    },
+    {
         "name": "SEC - Press Releases",
         "url": "https://www.sec.gov/news/pressreleases.rss",
         "category": "regulation",
         "weight": 30,
+    },
+    {
+        "name": "CFTC - General Press Releases",
+        "url": "https://www.cftc.gov/RSS/RSSGP/rssgp.xml",
+        "category": "regulation",
+        "weight": 22,
+        "tier": "PRIMARY",
+        "priority": "HIGH",
     },
     {
         "name": "TreasuryDirect - Auction Announcements",
@@ -67,6 +91,26 @@ RSS_FEEDS = [
         "url": "https://ec.europa.eu/commission/presscorner/api/rss",
         "category": "regulation",
         "weight": 22,
+    },
+    {
+        "name": "Eurostat - Economy and Finance Releases",
+        "url": "https://ec.europa.eu/eurostat/en/search?_estatsearchportlet_WAR_estatsearchportlet_collection=CAT_PREREL&_estatsearchportlet_WAR_estatsearchportlet_theme=PER_ECOFIN&p_p_id=estatsearchportlet_WAR_estatsearchportlet&p_p_lifecycle=2&p_p_mode=view&p_p_resource_id=atom&p_p_state=maximized",
+        "category": "macro",
+        "weight": 22,
+        "tier": "PRIMARY",
+        "priority": "HIGH",
+    },
+
+    # ==========================================================
+    # PRIMARY - ENERGY / COMMODITIES
+    # ==========================================================
+    {
+        "name": "EIA - Press Releases",
+        "url": "https://www.eia.gov/rss/press_rss.xml",
+        "category": "energy",
+        "weight": 22,
+        "tier": "PRIMARY",
+        "priority": "HIGH",
     },
 
     # ==========================================================

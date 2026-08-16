@@ -7,13 +7,19 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from config import REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT
+from config import (
+    MARKET_DATA_TIMEOUT_SECONDS,
+    REDDIT_CLIENT_ID,
+    REDDIT_CLIENT_SECRET,
+    REDDIT_USER_AGENT,
+)
 from models import NewsItem
 from sources_registry import apply_source_metadata
 
 
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 REDDIT_API_BASE = "https://oauth.reddit.com"
+REDDIT_DISABLED_STATUS = "DISABLED_PENDING_APPROVAL"
 REDDIT_SUBREDDITS = [
     "Bitcoin",
     "CryptoCurrency",
@@ -74,7 +80,7 @@ class RedditClient:
         client_id=REDDIT_CLIENT_ID,
         client_secret=REDDIT_CLIENT_SECRET,
         user_agent=REDDIT_USER_AGENT,
-        timeout=10,
+        timeout=MARKET_DATA_TIMEOUT_SECONDS,
     ):
         self.client_id = client_id
         self.client_secret = client_secret
@@ -85,6 +91,9 @@ class RedditClient:
 
     def configured(self):
         return bool(self.client_id and self.client_secret and self.user_agent)
+
+    def approved(self):
+        return False
 
     def token(self):
         if not self.configured():
@@ -263,8 +272,9 @@ def summarize_reddit(posts, accepted, errors=None, status="OK"):
 
 def get_reddit_news(limit_per_subreddit=12, client=None):
     client = client or RedditClient()
-    if not client.configured():
-        return [], RedditStatus(status="NOT_CONFIGURED")
+    approved = getattr(client, "approved", lambda: True)
+    if not client.configured() or not approved():
+        return [], RedditStatus(status=REDDIT_DISABLED_STATUS)
 
     posts = []
     accepted = []

@@ -1,11 +1,13 @@
 import json
+import socket
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from config import BLOCKWORKS_API_KEY, GLASSNODE_API_KEY
+from config import BLOCKWORKS_API_KEY, GLASSNODE_API_KEY, MARKET_DATA_TIMEOUT_SECONDS
 
 
 BINANCE_FAPI_BASE_URL = "https://fapi.binance.com"
@@ -141,7 +143,7 @@ def _pct_change(current, previous):
 
 class BinanceMarketDataClient:
 
-    def __init__(self, base_url=BINANCE_FAPI_BASE_URL, timeout=10):
+    def __init__(self, base_url=BINANCE_FAPI_BASE_URL, timeout=MARKET_DATA_TIMEOUT_SECONDS):
         self.base_url = base_url
         self.timeout = timeout
 
@@ -217,7 +219,7 @@ class BlockworksEtfFlowClient:
         self,
         api_key=BLOCKWORKS_API_KEY,
         base_url=BLOCKWORKS_API_BASE_URL,
-        timeout=10,
+        timeout=MARKET_DATA_TIMEOUT_SECONDS,
     ):
         self.api_key = api_key
         self.base_url = base_url
@@ -255,7 +257,7 @@ class GlassnodeOnchainClient:
         self,
         api_key=GLASSNODE_API_KEY,
         base_url=GLASSNODE_API_BASE_URL,
-        timeout=10,
+        timeout=MARKET_DATA_TIMEOUT_SECONDS,
     ):
         self.api_key = api_key
         self.base_url = base_url
@@ -575,6 +577,8 @@ def fetch_btc_onchain_snapshot(client=None):
         snapshot.btc_active_addresses = coin_metrics.get("AdrActCnt")
         snapshot.btc_hash_rate = coin_metrics.get("HashRate")
         snapshot.coin_metrics_status = coin_metrics.get("status", "UNKNOWN")
+        if coin_metrics.get("error"):
+            snapshot.errors.append(coin_metrics["error"])
         return snapshot
     except Exception as exc:
         snapshot = BtcOnchainSnapshot(
@@ -585,9 +589,17 @@ def fetch_btc_onchain_snapshot(client=None):
         return snapshot
 
 
+def _is_timeout_exception(exc):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, URLError):
+        return isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout))
+    return False
+
+
 class CoinMetricsCommunityClient:
 
-    def __init__(self, base_url="https://community-api.coinmetrics.io/v4", timeout=10):
+    def __init__(self, base_url="https://community-api.coinmetrics.io/v4", timeout=MARKET_DATA_TIMEOUT_SECONDS):
         self.base_url = base_url
         self.timeout = timeout
 
@@ -612,5 +624,7 @@ def fetch_coin_metrics_context(client=None):
             "HashRate": _safe_float(latest.get("HashRate")),
             "status": "OK" if latest else "UNAVAILABLE_FREE_SOURCE",
         }
-    except Exception:
+    except Exception as exc:
+        if _is_timeout_exception(exc):
+            return {"status": "API_ERROR", "error": "coinmetrics_timeout"}
         return {"status": "API_ERROR"}

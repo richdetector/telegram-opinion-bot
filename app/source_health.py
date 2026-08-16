@@ -1,11 +1,20 @@
 from datetime import datetime
+from urllib.request import Request, urlopen
 
 import feedparser
+
+from config import RSS_TIMEOUT_SECONDS
 
 
 FEED_REQUEST_HEADERS = {
     "User-Agent": "RadarMarketIntelligence/1.0 (+https://example.com; RSS health check)"
 }
+
+
+def _fetch_feed(url):
+    request = Request(url, headers=FEED_REQUEST_HEADERS)
+    with urlopen(request, timeout=RSS_TIMEOUT_SECONDS) as response:
+        return response.read()
 
 
 def check_rss_sources(feeds, limit=None):
@@ -24,10 +33,7 @@ def check_rss_sources(feeds, limit=None):
         }
 
         try:
-            parsed = feedparser.parse(
-                feed_info["url"],
-                request_headers=FEED_REQUEST_HEADERS,
-            )
+            parsed = feedparser.parse(_fetch_feed(feed_info["url"]))
             result["status"] = getattr(parsed, "status", None)
             result["entries"] = len(getattr(parsed, "entries", []) or [])
 

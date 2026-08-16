@@ -1,4 +1,7 @@
 from diagnostics import format_discard_counters
+from quiet_market import format_quiet_market_diagnostic
+from runtime_guards import format_network_counters
+from seen_cache import format_intake_stats, format_source_performance
 
 
 def _list_text(values):
@@ -41,8 +44,14 @@ def print_funnel_summary(funnel, discard_counters):
     print(f"Reviewer PASS:               {funnel.get('reviewer_pass', False)}")
     print(f"Habrían sido publicadas:     {funnel.get('would_publish', 0)}")
     print()
+    print("INTAKE / NOVELTY")
+    print(format_intake_stats(funnel.get("intake_stats")))
+    print()
     print("DESCARTES")
     print(format_discard_counters(discard_counters))
+    print()
+    print("NETWORK / TIMEOUTS")
+    print(format_network_counters(funnel.get("network_counters")))
     print()
     print("REDDIT")
     reddit_status = funnel.get("reddit_status")
@@ -73,6 +82,13 @@ def print_funnel_summary(funnel, discard_counters):
         print(f"Latest relevant declaration: {truth_status.latest_relevant_declaration or 'None'}")
         if truth_status.errors:
             print(f"Errors:                      {_list_text(truth_status.errors)}")
+    print()
+    quiet_market = funnel.get("quiet_market")
+    if quiet_market is not None:
+        print(format_quiet_market_diagnostic(quiet_market))
+    print()
+    print("SOURCE PERFORMANCE")
+    print(format_source_performance(funnel.get("source_performance")))
     print("========================================\n")
 
 
@@ -358,9 +374,17 @@ def print_final_decision_gate(results):
     print("========================================\n")
 
 
-def print_dry_run_report(news, messages):
+def report_mode_title(dry_run=True, shadow=False):
+    if dry_run:
+        return "RADAR — DRY RUN"
+    if shadow:
+        return "RADAR — SHADOW AUTO"
+    return "RADAR — LIVE"
+
+
+def print_dry_run_report(news, messages, dry_run=True, shadow=False):
     print("\n========================================")
-    print("RADAR — DRY RUN")
+    print(report_mode_title(dry_run=dry_run, shadow=shadow))
     print("========================================")
 
     if not news:

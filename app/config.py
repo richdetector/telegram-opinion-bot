@@ -67,3 +67,17 @@ AUTO_PUBLISH_MAX_PER_DAY = int(os.getenv("AUTO_PUBLISH_MAX_PER_DAY") or 2)
 AUTO_PUBLISH_DUPLICATE_WINDOW_HOURS = int(
     os.getenv("AUTO_PUBLISH_DUPLICATE_WINDOW_HOURS") or 24
 )
+
+# Network/runtime safety defaults for unattended 24/7 operation.
+RSS_TIMEOUT_SECONDS = int(os.getenv("RSS_TIMEOUT_SECONDS") or 15)
+ARTICLE_TIMEOUT_SECONDS = int(os.getenv("ARTICLE_TIMEOUT_SECONDS") or 15)
+TELEGRAM_TIMEOUT_SECONDS = int(os.getenv("TELEGRAM_TIMEOUT_SECONDS") or 30)
+MARKET_DATA_TIMEOUT_SECONDS = int(os.getenv("MARKET_DATA_TIMEOUT_SECONDS") or 15)
+OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS") or 60)
+CYCLE_TIMEOUT_SECONDS = int(os.getenv("CYCLE_TIMEOUT_SECONDS") or 180)
+
+# Quiet Market Mode: secondary lane for infrequent market-state notes.
+QUIET_MARKET_ENABLED = _env_bool("QUIET_MARKET_ENABLED", default=True)
+QUIET_MARKET_AFTER_HOURS = int(os.getenv("QUIET_MARKET_AFTER_HOURS") or 12)
+QUIET_MARKET_MAX_PER_DAY = int(os.getenv("QUIET_MARKET_MAX_PER_DAY") or 1)
+QUIET_MARKET_MIN_SCORE = int(os.getenv("QUIET_MARKET_MIN_SCORE") or 70)

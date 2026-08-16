@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 
-from config import SANTIMENT_API_KEY
+from config import MARKET_DATA_TIMEOUT_SECONDS, SANTIMENT_API_KEY
 
 
 SANTIMENT_API_URL = "https://api.santiment.net/graphql"
@@ -88,7 +88,12 @@ class SantimentSentimentClient:
     optional source and degrades to UNKNOWN if metric access is unavailable.
     """
 
-    def __init__(self, api_key=SANTIMENT_API_KEY, url=SANTIMENT_API_URL, timeout=10):
+    def __init__(
+        self,
+        api_key=SANTIMENT_API_KEY,
+        url=SANTIMENT_API_URL,
+        timeout=MARKET_DATA_TIMEOUT_SECONDS,
+    ):
         self.api_key = api_key
         self.url = url
         self.timeout = timeout

@@ -1,5 +1,8 @@
 import sys
+import time
+import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -12,18 +15,23 @@ from auto_publish_engine import should_auto_publish
 from crypto_market_engine import (
     analyze_btc_market_state,
     analyze_btc_market_snapshot,
+    BtcMarketState,
     fetch_btc_market_state,
     market_state_to_news_item,
 )
 from deduper import dedupe_news
 from diagnostics import count_pre_candidate_rejections
-from dry_run_report import print_dry_run_report
+from dry_run_report import print_dry_run_report, report_mode_title
 from editor_selector import select_news_with_ai
 from liquidity_structure_engine import (
     BtcLiquidityStructureSnapshot,
     LiquidityCluster,
 )
-from main import _preselect_market_candidates, _revalidate_precandidates_after_download
+from main import (
+    _preselect_market_candidates,
+    _revalidate_precandidates_after_download,
+    process_news,
+)
 from market_scorer import can_reach_selection, score_market_item
 from market_data import BtcEtfFlowSnapshot, BtcMarketSnapshot
 from market_data import (
@@ -41,6 +49,13 @@ from publication_gate import (
     apply_publication_gate,
     evaluate_item,
 )
+from quiet_market import (
+    QUIET_MARKET_CATEGORY,
+    evaluate_quiet_market,
+    review_quiet_market_message,
+    select_quiet_market_angle,
+)
+from rss_audit import audit_rss_sources, recommend_source
 from sentiment_engine import BtcSentimentSnapshot
 from rumor_gate import (
     apply_rumor_gate,
@@ -64,6 +79,14 @@ from reddit_reader import (
     post_to_news_item,
     summarize_reddit,
 )
+from seen_cache import (
+    SeenCache,
+    canonical_url,
+    event_fingerprint,
+    title_fingerprint,
+)
+from runner import run_one_cycle, runner as radar_runner
+from runtime_guards import run_sync_phase
 from sources_registry import apply_source_metadata, source_metadata
 from telegram_sources import CHANNELS, CHANNEL_METADATA
 from verification import verify_news
@@ -121,6 +144,43 @@ def critical_trump_threat():
     news.market_signals = ["policy declaration"]
     news.confluence_score = 45
     return news
+
+
+def quiet_btc_state(
+    price_change=0.3,
+    volatility_z=-1.6,
+    volume_z=-1.3,
+    funding="NORMAL",
+    oi_change=0.4,
+    book_imbalance=0.05,
+):
+    snapshot = BtcMarketSnapshot(
+        price=100000,
+        price_change_24h=price_change,
+        volume_zscore=volume_z,
+        open_interest_change=oi_change,
+        funding_extreme=funding,
+        volatility_zscore=volatility_z,
+        timestamp="2026-08-16T12:00:00+00:00",
+    )
+    liquidity = BtcLiquidityStructureSnapshot(
+        book_imbalance=book_imbalance,
+        timestamp="2026-08-16T12:00:00+00:00",
+    )
+    return BtcMarketState(
+        snapshot=snapshot,
+        liquidity_structure=liquidity,
+        confluence="LOW",
+        confluence_score=10,
+        market_regime="NEUTRAL",
+        summary="NO MATERIAL BTC MARKET ANOMALY",
+    )
+
+
+def temp_seen_cache():
+    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+    tmp.close()
+    return SeenCache(tmp.name)
 
 
 class MarketIntelligenceTests(unittest.TestCase):
@@ -257,6 +317,20 @@ class MarketIntelligenceTests(unittest.TestCase):
 
         self.assertEqual(selected, [])
         print_dry_run_report([], [])
+
+    def test_report_mode_titles(self):
+        self.assertEqual(
+            report_mode_title(dry_run=True, shadow=False),
+            "RADAR — DRY RUN",
+        )
+        self.assertEqual(
+            report_mode_title(dry_run=False, shadow=True),
+            "RADAR — SHADOW AUTO",
+        )
+        self.assertEqual(
+            report_mode_title(dry_run=False, shadow=False),
+            "RADAR — LIVE",
+        )
 
     def test_btc_high_or_critical_can_survive(self):
         news = score_market_item(
@@ -1427,7 +1501,27 @@ class MarketIntelligenceTests(unittest.TestCase):
         news, status = get_reddit_news(client=NotConfiguredClient())
 
         self.assertEqual(news, [])
-        self.assertEqual(status.status, "NOT_CONFIGURED")
+        self.assertEqual(status.status, "DISABLED_PENDING_APPROVAL")
+        self.assertEqual(status.posts_read, 0)
+        self.assertEqual(status.posts_accepted, 0)
+
+    def test_reddit_pending_approval_makes_no_http_requests(self):
+        class PendingClient:
+            def configured(self):
+                return True
+
+            def approved(self):
+                return False
+
+            def subreddit_new(self, subreddit, limit=25):
+                raise AssertionError("Reddit HTTP should not be called while disabled.")
+
+        news, status = get_reddit_news(client=PendingClient())
+
+        self.assertEqual(news, [])
+        self.assertEqual(status.status, "DISABLED_PENDING_APPROVAL")
+        self.assertEqual(status.posts_read, 0)
+        self.assertEqual(status.posts_accepted, 0)
 
     def test_reddit_429_is_safe_failure(self):
         from urllib.error import HTTPError
@@ -1854,6 +1948,655 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertEqual(counters["pre_candidate_low_rejected"], 1)
         self.assertEqual(counters["pre_candidate_medium_rejected"], 1)
         self.assertEqual(counters["pre_candidate_rumor_rejected"], 1)
+
+    def test_quiet_btc_half_percent_for_few_hours_no_note(self):
+        now = datetime(2026, 8, 16, 12, 0)
+        history = [
+            {
+                "date": (now - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"),
+                "status": "published",
+                "category": "Market State",
+                "link": "material:1",
+            }
+        ]
+
+        decision = evaluate_quiet_market(quiet_btc_state(), history=history, now=now)
+
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.skipped, "recent_material_post")
+
+    def test_quiet_24h_range_compressed_vol_neutral_funding_candidate(self):
+        now = datetime(2026, 8, 16, 12, 0)
+
+        decision = evaluate_quiet_market(
+            quiet_btc_state(),
+            history=[],
+            now=now,
+        )
+
+        self.assertTrue(decision.passed)
+        self.assertEqual(decision.state, "COMPRESSION")
+        self.assertIn("📊 MARKET NOTE", decision.message)
+
+    def test_quiet_note_is_spanish_and_uses_concrete_data(self):
+        decision = evaluate_quiet_market(quiet_btc_state(), history=[])
+
+        self.assertTrue(decision.passed)
+        lowered = decision.message.lower()
+        self.assertIn("bitcoin cotiza cerca de $100,000", lowered)
+        self.assertIn("24 horas", lowered)
+        self.assertIn("qué muestran los datos", lowered)
+        self.assertNotIn("btc 24h move", lowered)
+        self.assertNotIn("funding is neutral", lowered)
+
+    def test_quiet_note_does_not_print_unknown_as_data(self):
+        decision = evaluate_quiet_market(quiet_btc_state(), history=[])
+
+        self.assertTrue(decision.passed)
+        self.assertNotIn("UNKNOWN", decision.message)
+
+    def test_quiet_angle_changes_with_market_signals(self):
+        base = quiet_btc_state()
+        funding = quiet_btc_state(funding="POSITIVE")
+
+        self.assertEqual(select_quiet_market_angle(base), "VOLATILITY_COMPRESSION")
+        self.assertEqual(select_quiet_market_angle(funding), "FUNDING_SHIFT")
+
+    def test_quiet_funding_or_oi_angle_can_beat_range(self):
+        decision = evaluate_quiet_market(quiet_btc_state(oi_change=7.0), history=[])
+
+        self.assertTrue(decision.passed)
+        self.assertEqual(decision.angle, "OI_DIVERGENCE")
+        self.assertIn("open interest", decision.message.lower())
+
+    def test_quiet_market_without_enough_data_no_note(self):
+        snapshot = BtcMarketSnapshot(timestamp="2026-08-16T12:00:00+00:00")
+        state = BtcMarketState(snapshot=snapshot, confluence="LOW")
+
+        decision = evaluate_quiet_market(state, history=[])
+
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.skipped, "low_quiet_score")
+
+    def test_market_alert_existing_blocks_quiet_note(self):
+        decision = evaluate_quiet_market(
+            quiet_btc_state(),
+            has_market_alert=True,
+            history=[],
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.skipped, "market_alert_priority")
+
+    def test_quiet_note_six_hours_ago_does_not_repeat(self):
+        now = datetime(2026, 8, 16, 12, 0)
+        history = [
+            {
+                "date": (now - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M"),
+                "status": "published",
+                "category": QUIET_MARKET_CATEGORY,
+                "link": "quiet:1",
+            }
+        ]
+
+        decision = evaluate_quiet_market(quiet_btc_state(), history=history, now=now)
+
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.skipped, "frequency_limit")
+
+    def test_quiet_note_after_structure_or_oi_change_eventually_possible(self):
+        now = datetime(2026, 8, 16, 12, 0)
+        history = [
+            {
+                "date": (now - timedelta(hours=25)).strftime("%Y-%m-%d %H:%M"),
+                "status": "published",
+                "category": QUIET_MARKET_CATEGORY,
+                "link": "quiet:1",
+            }
+        ]
+
+        decision = evaluate_quiet_market(
+            quiet_btc_state(oi_change=7.0),
+            history=history,
+            now=now,
+        )
+
+        self.assertTrue(decision.passed)
+        self.assertIn("apalancamiento", decision.message.lower())
+
+    def test_quiet_wallet_transfer_isolated_never_whales_going_long(self):
+        decision = evaluate_quiet_market(quiet_btc_state(), history=[])
+
+        self.assertNotIn("whales are going long", decision.message.lower())
+        self.assertNotIn("whales going long", decision.message.lower())
+
+    def test_quiet_onchain_outflow_language_is_conservative(self):
+        message = (
+            "Se observan retiradas elevadas de BTC de exchanges respecto al baseline. "
+            "El dato es consistente con menor oferta disponible en exchanges, aunque no demuestra acumulacion institucional."
+        )
+
+        review = review_quiet_market_message(message)
+
+        self.assertTrue(review["ok"])
+
+    def test_quiet_reviewer_requires_angle_and_observations_when_provided(self):
+        review = review_quiet_market_message(
+            "📊 MARKET NOTE\n\nSituación: Bitcoin cotiza estable.",
+            angle="UNKNOWN",
+            observations=["Solo una observación."],
+        )
+
+        self.assertFalse(review["ok"])
+        self.assertIn("missing_angle", review["errors"])
+        self.assertIn("insufficient_observations", review["errors"])
+
+    def test_quiet_reviewer_fail_blocks_note(self):
+        decision = evaluate_quiet_market(
+            quiet_btc_state(),
+            history=[],
+            reviewer_ok=False,
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.skipped, "reviewer_failed")
+
+    def test_quiet_note_has_no_buy_sell_or_prediction_certainty(self):
+        decision = evaluate_quiet_market(quiet_btc_state(), history=[])
+
+        lowered = decision.message.lower()
+        self.assertNotIn("buy", lowered)
+        self.assertNotIn("sell", lowered)
+        self.assertNotIn("va a subir", lowered)
+        self.assertNotIn("va a caer", lowered)
+        self.assertNotIn("price target", lowered)
+
+    def test_seen_cache_same_url_second_cycle_not_processed(self):
+        cache = temp_seen_cache()
+        first = item("Fed cuts rates by 25 bps", source="Reuters")
+        second = item("Fed cuts rates by 25 bps", source="Reuters")
+
+        new_first, stats_first = cache.filter_new_items([first])
+        new_second, stats_second = cache.filter_new_items([second])
+
+        self.assertEqual(len(new_first), 1)
+        self.assertEqual(len(new_second), 0)
+        self.assertEqual(stats_second.exact_duplicates, 1)
+
+    def test_canonical_url_strips_tracking_params(self):
+        one = canonical_url("https://example.com/story?utm_source=x&id=42#section")
+        two = canonical_url("https://example.com/story?id=42")
+
+        self.assertEqual(one, two)
+
+    def test_seen_cache_utm_url_is_duplicate(self):
+        cache = temp_seen_cache()
+        first = item("SEC approves major Bitcoin ETF rule")
+        first.link = "https://example.com/story?id=42&utm_source=newsletter"
+        second = item("SEC approves major Bitcoin ETF rule")
+        second.link = "https://example.com/story?id=42&utm_campaign=x"
+
+        cache.filter_new_items([first])
+        new_second, stats = cache.filter_new_items([second])
+
+        self.assertEqual(new_second, [])
+        self.assertEqual(stats.exact_duplicates, 1)
+
+    def test_seen_cache_exact_title_duplicate(self):
+        cache = temp_seen_cache()
+        first = item("Fed cuts rates by 25 bps")
+        second = item("Fed cuts rates by 25 bps")
+        second.link = "https://another.example.com/fed-cut"
+
+        cache.filter_new_items([first])
+        new_second, stats = cache.filter_new_items([second])
+
+        self.assertEqual(new_second, [])
+        self.assertEqual(stats.near_duplicates, 1)
+
+    def test_seen_cache_semantically_similar_titles_same_event(self):
+        cache = temp_seen_cache()
+        first = item("Fed cuts rates by 25 bps", source="Reuters")
+        second = item("Federal Reserve cuts rates 25 basis points", source="Bloomberg")
+        second.link = "https://bloomberg.example.com/fed"
+
+        cache.filter_new_items([first])
+        new_second, stats = cache.filter_new_items([second])
+
+        self.assertEqual(new_second, [])
+        self.assertEqual(stats.same_event_merges, 1)
+
+    def test_supporting_source_does_not_take_extra_slot(self):
+        cache = temp_seen_cache()
+        first = item("Fed cuts rates by 25 bps", source="Reuters")
+        second = item("Federal Reserve cuts rates 25 basis points", source="Bloomberg")
+        first.link = "https://reuters.example.com/fed"
+        second.link = "https://bloomberg.example.com/fed"
+
+        accepted, stats = cache.filter_new_items([first, second])
+
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(stats.same_event_merges, 1)
+        self.assertIn("Bloomberg", accepted[0].related_sources)
+
+    def test_rumor_to_confirmed_is_material_update(self):
+        cache = temp_seen_cache()
+        rumor = item("Rumor: Trump may impose 50 percent tariffs on China")
+        confirmed = item("Trump confirmed 50 percent tariffs on China")
+        confirmed.link = "https://example.com/confirmed-tariffs"
+
+        cache.filter_new_items([rumor])
+        accepted, stats = cache.filter_new_items([confirmed])
+
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(stats.material_updates, 1)
+
+    def test_same_event_reworded_is_not_update(self):
+        cache = temp_seen_cache()
+        first = item("Trump may impose 50 percent tariffs on China")
+        second = item("Trump could impose 50 percent tariffs on China")
+        second.link = "https://example.com/tariffs-rewrite"
+
+        cache.filter_new_items([first])
+        accepted, stats = cache.filter_new_items([second])
+
+        self.assertEqual(accepted, [])
+        self.assertEqual(stats.same_event_merges, 1)
+
+    def test_telegram_same_message_id_not_re_read(self):
+        import asyncio
+        import telegram_reader
+
+        class Message:
+            id = 10
+            text = "Fed unexpectedly changes rate guidance, affecting yields, USD, equities and BTC risk sentiment."
+            date = datetime.utcnow()
+
+        class FakeClient:
+            async def start(self):
+                return None
+
+            async def get_messages(self, channel, **kwargs):
+                if kwargs.get("min_id") == 10:
+                    return []
+                return [Message()]
+
+            async def disconnect(self):
+                return None
+
+        cache = temp_seen_cache()
+        with patch.object(telegram_reader, "client", FakeClient()), \
+            patch.object(telegram_reader, "CHANNELS", ["Bloomberg"]):
+            first = asyncio.run(telegram_reader.get_telegram_news(seen_cache=cache))
+            second = asyncio.run(telegram_reader.get_telegram_news(seen_cache=cache))
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+
+    def test_telegram_new_message_id_enters(self):
+        import asyncio
+        import telegram_reader
+
+        class Message:
+            def __init__(self, message_id):
+                self.id = message_id
+                self.text = "Fed unexpectedly changes rate guidance, affecting yields, USD, equities and BTC risk sentiment."
+                self.date = datetime.utcnow()
+
+        class FakeClient:
+            async def start(self):
+                return None
+
+            async def get_messages(self, channel, **kwargs):
+                min_id = kwargs.get("min_id") or 0
+                return [Message(11)] if min_id < 11 else []
+
+            async def disconnect(self):
+                return None
+
+        cache = temp_seen_cache()
+        cache.update_source_state("Bloomberg", entry_id="10")
+        with patch.object(telegram_reader, "client", FakeClient()), \
+            patch.object(telegram_reader, "CHANNELS", ["Bloomberg"]):
+            news = asyncio.run(telegram_reader.get_telegram_news(seen_cache=cache))
+
+        self.assertEqual(len(news), 1)
+
+    def test_rss_old_entry_is_not_reprocessed(self):
+        import collector
+
+        rss = b"""<?xml version="1.0"?><rss><channel><item><title>Fed cuts rates by 25 bps</title><link>https://example.com/fed</link><guid>fed-1</guid><pubDate>Sun, 16 Aug 2026 10:00:00 GMT</pubDate></item></channel></rss>"""
+        cache = temp_seen_cache()
+
+        with patch.object(collector, "RSS_FEEDS", [{"name": "Test RSS", "url": "https://feed.example.com"}]), \
+            patch.object(collector, "_fetch_bytes", return_value=rss):
+            first = collector.get_news(seen_cache=cache)
+            second = collector.get_news(seen_cache=cache)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+
+    def test_rss_new_entry_is_processed(self):
+        import collector
+
+        rss_one = b"""<?xml version="1.0"?><rss><channel><item><title>Fed cuts rates by 25 bps</title><link>https://example.com/fed1</link><guid>fed-1</guid></item></channel></rss>"""
+        rss_two = b"""<?xml version="1.0"?><rss><channel><item><title>Fed confirms rate cut details</title><link>https://example.com/fed2</link><guid>fed-2</guid></item><item><title>Fed cuts rates by 25 bps</title><link>https://example.com/fed1</link><guid>fed-1</guid></item></channel></rss>"""
+        cache = temp_seen_cache()
+
+        with patch.object(collector, "RSS_FEEDS", [{"name": "Test RSS", "url": "https://feed.example.com"}]):
+            with patch.object(collector, "_fetch_bytes", return_value=rss_one):
+                collector.get_news(seen_cache=cache)
+            with patch.object(collector, "_fetch_bytes", return_value=rss_two):
+                second = collector.get_news(seen_cache=cache)
+
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0].link, "https://example.com/fed2")
+
+    def test_duplicate_never_consumes_openai(self):
+        cache = temp_seen_cache()
+        first = item("Fed cuts rates by 25 bps")
+        second = item("Fed cuts rates by 25 bps")
+        cache.filter_new_items([first])
+        accepted, _ = cache.filter_new_items([second])
+        openai = Mock()
+
+        if accepted:
+            openai(accepted)
+
+        openai.assert_not_called()
+
+    def test_duplicate_never_occupies_selector_slot(self):
+        cache = temp_seen_cache()
+        items = [
+            item("Fed cuts rates by 25 bps", source="Reuters"),
+            item("Federal Reserve cuts rates 25 basis points", source="Bloomberg"),
+            item("Fed cuts rates by 25 bps", source="Financial Times"),
+        ]
+        items[1].link = "https://b.example.com/fed"
+        items[2].link = "https://ft.example.com/fed"
+
+        accepted, _ = cache.filter_new_items(items)
+
+        self.assertEqual(len(accepted), 1)
+
+    def test_quiet_market_unchanged_does_not_repeat(self):
+        cache = temp_seen_cache()
+        first = evaluate_quiet_market(quiet_btc_state(), history=[], seen_cache=cache)
+        second = evaluate_quiet_market(quiet_btc_state(), history=[], seen_cache=cache)
+
+        self.assertTrue(first.passed)
+        self.assertFalse(second.passed)
+        self.assertEqual(second.skipped, "unchanged_market_state")
+
+    def test_quiet_market_state_changed_can_note(self):
+        cache = temp_seen_cache()
+        first = evaluate_quiet_market(quiet_btc_state(), history=[], seen_cache=cache)
+        second = evaluate_quiet_market(quiet_btc_state(oi_change=7.0), history=[], seen_cache=cache)
+
+        self.assertTrue(first.passed)
+        self.assertTrue(second.passed)
+
+    def test_seen_cache_persists_after_restart(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        path = tmp.name
+        tmp.close()
+        first_cache = SeenCache(path)
+        first_cache.filter_new_items([item("Fed cuts rates by 25 bps")])
+        second_cache = SeenCache(path)
+
+        accepted, stats = second_cache.filter_new_items([item("Fed cuts rates by 25 bps")])
+
+        self.assertEqual(accepted, [])
+        self.assertEqual(stats.exact_duplicates, 1)
+
+    def test_source_performance_counts_duplicates_and_new_items(self):
+        cache = temp_seen_cache()
+        first = item("Fed cuts rates by 25 bps", source="Reuters")
+        second = item("Fed cuts rates by 25 bps", source="Reuters")
+
+        cache.filter_new_items([first])
+        cache.filter_new_items([second])
+        row = cache.source_performance()[0]
+
+        self.assertEqual(row["items_seen"], 2)
+        self.assertEqual(row["items_new"], 1)
+        self.assertEqual(row["duplicates"], 1)
+
+    def test_source_performance_window_persists(self):
+        path = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
+        cache = SeenCache(path)
+        cache.increment_source("Test Source", "items_seen", 3)
+        cache.increment_source("Test Source", "items_new", 1)
+
+        restarted = SeenCache(path)
+        row = restarted.source_performance_window(hours=24)[0]
+
+        self.assertEqual(row["source"], "Test Source")
+        self.assertEqual(row["items_seen"], 3)
+        self.assertEqual(row["items_new"], 1)
+
+    def test_rss_dead_feed_recommendation_is_fix(self):
+        feed = {"name": "Dead Feed", "category": "markets", "url": "https://dead.example.com"}
+
+        recommendation = recommend_source(feed, health={"error_count": 1, "last_error": "HTTPError"})
+
+        self.assertEqual(recommendation, "FIX")
+
+    def test_rss_recovered_feed_status_healthy(self):
+        cache = temp_seen_cache()
+        feeds = [{"name": "Recovered Feed", "category": "markets", "url": "https://ok.example.com"}]
+
+        with patch("rss_audit.check_rss_sources", return_value=[
+            {
+                "source": "Recovered Feed",
+                "status": 200,
+                "last_success": "2026-08-16T12:00:00",
+                "last_error": "",
+                "entries": 5,
+                "error_count": 0,
+            }
+        ]):
+            rows = audit_rss_sources(feeds=feeds, cache=cache, check_live=True)
+
+        self.assertEqual(rows[0].status, "HEALTHY")
+        self.assertEqual(rows[0].recommendation, "WATCH")
+
+    def test_rss_primary_source_preferred_and_kept(self):
+        feed = {
+            "name": "Federal Reserve - Monetary Policy",
+            "category": "macro",
+            "tier": "PRIMARY",
+            "priority": "CRITICAL",
+        }
+
+        recommendation = recommend_source(feed, perf_7d={"items_seen": 100, "precandidates": 0})
+
+        self.assertEqual(recommendation, "KEEP")
+
+    def test_rss_high_noise_source_can_be_downgraded(self):
+        feed = {"name": "Noisy Background", "category": "technology", "priority": "LOW"}
+        perf = {"items_seen": 100, "duplicates": 85, "precandidates": 0, "material_updates": 0}
+
+        recommendation = recommend_source(feed, perf_7d=perf)
+
+        self.assertEqual(recommendation, "DOWNGRADE")
+
+    def test_rss_recommendation_does_not_auto_disable_feed(self):
+        feed = {"name": "Broken Background", "category": "world", "priority": "LOW"}
+
+        recommendation = recommend_source(feed, perf_7d={"items_seen": 20, "errors": 15})
+
+        self.assertEqual(recommendation, "DISABLE")
+        self.assertNotIn("disabled", feed)
+
+    def test_feed_http_error_does_not_break_cycle(self):
+        import collector
+
+        cache = temp_seen_cache()
+        with patch.object(collector, "RSS_FEEDS", [{"name": "Broken RSS", "url": "https://feed.example.com"}]), \
+            patch.object(collector, "_fetch_bytes", side_effect=Exception("HTTPError")):
+            news = collector.get_news(seen_cache=cache)
+
+        self.assertEqual(news, [])
+        self.assertEqual(cache.source_performance()[0]["errors"], 1)
+
+    def test_sync_phase_timeout_returns_fallback(self):
+        def hanging_call():
+            time.sleep(0.05)
+            return ["late"]
+
+        result = __import__("asyncio").run(
+            run_sync_phase(
+                "RSS",
+                hanging_call,
+                timeout=0.01,
+                fallback=[],
+            )
+        )
+
+        self.assertEqual(result, [])
+
+    def test_rss_hang_times_out_and_cycle_continues(self):
+        def hanging_rss(*args, **kwargs):
+            time.sleep(0.05)
+            return [publishable_item()]
+
+        with patch("main.RSS_TIMEOUT_SECONDS", 0.01), \
+            patch("main.get_news", side_effect=hanging_rss), \
+            patch("main.get_telegram_news", new_callable=AsyncMock, return_value=[]), \
+            patch("main.get_reddit_news", return_value=([], RedditStatus(status="NOT_CONFIGURED"))), \
+            patch("main.get_truth_social_news", return_value=([], None)), \
+            patch("main.fetch_btc_market_state", return_value=None), \
+            patch("main.SeenCache", side_effect=lambda: temp_seen_cache()), \
+            patch("main.DRY_RUN", True):
+
+            __import__("asyncio").run(process_news())
+
+    def test_article_download_hang_times_out(self):
+        candidate = publishable_item()
+
+        def hanging_download(*args, **kwargs):
+            time.sleep(0.05)
+            return [candidate]
+
+        with patch("main.ARTICLE_TIMEOUT_SECONDS", 0.01), \
+            patch("main.get_news", return_value=[candidate]), \
+            patch("main.get_telegram_news", new_callable=AsyncMock, return_value=[]), \
+            patch("main.get_reddit_news", return_value=([], RedditStatus(status="NOT_CONFIGURED"))), \
+            patch("main.get_truth_social_news", return_value=([], None)), \
+            patch("main.fetch_btc_market_state", return_value=None), \
+            patch("main.enrich_news", side_effect=hanging_download), \
+            patch("main.SeenCache", side_effect=lambda: temp_seen_cache()), \
+            patch("main.DRY_RUN", True):
+
+            __import__("asyncio").run(process_news())
+
+    def test_market_api_hang_does_not_block_news_engine(self):
+        def hanging_market_state(*args, **kwargs):
+            time.sleep(0.05)
+            return None
+
+        with patch("main.MARKET_DATA_TIMEOUT_SECONDS", 0.01), \
+            patch("main.get_news", return_value=[]), \
+            patch("main.get_telegram_news", new_callable=AsyncMock, return_value=[]), \
+            patch("main.get_reddit_news", return_value=([], RedditStatus(status="NOT_CONFIGURED"))), \
+            patch("main.get_truth_social_news", return_value=([], None)), \
+            patch("main.fetch_btc_market_state", side_effect=hanging_market_state), \
+            patch("main.SeenCache", side_effect=lambda: temp_seen_cache()), \
+            patch("main.DRY_RUN", True):
+
+            __import__("asyncio").run(process_news())
+
+    def test_telegram_timeout_allows_rss_to_continue(self):
+        async def hanging_telegram(*args, **kwargs):
+            await __import__("asyncio").sleep(0.05)
+            return []
+
+        with patch("main.TELEGRAM_TIMEOUT_SECONDS", 0.01), \
+            patch("main.get_news", return_value=[]), \
+            patch("main.get_telegram_news", side_effect=hanging_telegram), \
+            patch("main.get_reddit_news", return_value=([], RedditStatus(status="NOT_CONFIGURED"))), \
+            patch("main.get_truth_social_news", return_value=([], None)), \
+            patch("main.fetch_btc_market_state", return_value=None), \
+            patch("main.SeenCache", side_effect=lambda: temp_seen_cache()), \
+            patch("main.DRY_RUN", True):
+
+            __import__("asyncio").run(process_news())
+
+    def test_openai_timeout_does_not_publish_incomplete_story(self):
+        candidate = publishable_item()
+
+        def hanging_enricher(*args, **kwargs):
+            time.sleep(0.05)
+            return [candidate]
+
+        with patch("main.OPENAI_TIMEOUT_SECONDS", 0.01), \
+            patch("main.get_news", return_value=[candidate]), \
+            patch("main.get_telegram_news", new_callable=AsyncMock, return_value=[]), \
+            patch("main.get_reddit_news", return_value=([], RedditStatus(status="NOT_CONFIGURED"))), \
+            patch("main.get_truth_social_news", return_value=([], None)), \
+            patch("main.fetch_btc_market_state", return_value=None), \
+            patch("main.enrich_news", return_value=[candidate]), \
+            patch("main.enrich_metadata", side_effect=hanging_enricher), \
+            patch("main.publish_selected", new_callable=AsyncMock) as publisher, \
+            patch("main.SeenCache", side_effect=lambda: temp_seen_cache()), \
+            patch("main.DRY_RUN", False), \
+            patch("main.AUTO_PUBLISH_SHADOW", False):
+
+            __import__("asyncio").run(process_news())
+
+        publisher.assert_not_called()
+
+    def test_process_news_watchdog_aborts_cycle(self):
+        async def hanging_process():
+            await __import__("asyncio").sleep(0.05)
+
+        result = __import__("asyncio").run(
+            run_one_cycle(
+                process_func=hanging_process,
+                cycle_timeout=0.01,
+            )
+        )
+
+        self.assertEqual(result["status"], "watchdog_timeout")
+        self.assertEqual(result["network_counters"]["cycle_watchdog_timeout"], 1)
+
+    def test_runner_starts_another_cycle_after_watchdog(self):
+        calls = {"count": 0}
+
+        async def hanging_process():
+            calls["count"] += 1
+            await __import__("asyncio").sleep(0.05)
+
+        with patch("runner.CYCLE_TIMEOUT_SECONDS", 0.01):
+            __import__("asyncio").run(
+                radar_runner(
+                    process_func=hanging_process,
+                    check_every=0.01,
+                    max_cycles=2,
+                )
+            )
+
+        self.assertEqual(calls["count"], 2)
+
+    def test_timeout_path_does_not_publish_accidentally(self):
+        async def hanging_publish_process():
+            await __import__("asyncio").sleep(0.05)
+
+        result = __import__("asyncio").run(
+            run_one_cycle(
+                process_func=hanging_publish_process,
+                cycle_timeout=0.01,
+            )
+        )
+
+        self.assertEqual(result["status"], "watchdog_timeout")
+
+    def test_publication_gate_still_intact_after_timeout_changes(self):
+        news = publishable_item()
+        result = evaluate_item(news, review_ok=True)
+
+        self.assertTrue(result.passed)
 
 
 if __name__ == "__main__":

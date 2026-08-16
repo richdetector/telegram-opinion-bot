@@ -6,3 +6,8 @@ pending.json
 __pycache__/
 *.pyc
 .DS_Store
+
+radar.log
+radar_error.log
+seen_cache.sqlite
+seen_cache.sqlite-*
