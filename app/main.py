@@ -24,9 +24,10 @@ from config import (
     AUTO_PUBLISH_SHADOW,
     DRY_RUN,
     MARKET_DATA_TIMEOUT_SECONDS,
+    MARKET_DATA_PHASE_TIMEOUT_SECONDS,
     OPENAI_TIMEOUT_SECONDS,
+    RSS_PHASE_TIMEOUT_SECONDS,
     QUIET_MARKET_ENABLED,
-    RSS_TIMEOUT_SECONDS,
     TELEGRAM_TIMEOUT_SECONDS,
 )
 from crypto_market_engine import fetch_btc_market_state, market_state_to_news_item
@@ -43,6 +44,8 @@ from dry_run_report import (
     print_funnel_summary,
 )
 from formatter import format_report
+from intraday_engine import attach_intraday_catalyst
+from intraday_publication_gate import apply_intraday_publication_gate
 from publication_gate import apply_publication_gate
 from publishing import publish_selected
 from quiet_market import evaluate_quiet_market, quiet_market_fingerprint
@@ -173,7 +176,7 @@ async def process_news():
             diagnostics=network_counters,
             seen_cache=seen_cache,
         ),
-        timeout=RSS_TIMEOUT_SECONDS,
+        timeout=RSS_PHASE_TIMEOUT_SECONDS,
         fallback=[],
         counters=network_counters,
         timeout_counter="rss_timeout",
@@ -213,7 +216,7 @@ async def process_news():
             lambda: fetch_btc_market_state(
                 sentiment_fetcher=lambda: sentiment_from_reddit_status(reddit_status)
             ),
-            timeout=MARKET_DATA_TIMEOUT_SECONDS,
+            timeout=MARKET_DATA_PHASE_TIMEOUT_SECONDS,
             fallback=None,
             counters=network_counters,
             timeout_counter="market_data_timeout",
@@ -221,6 +224,16 @@ async def process_news():
         if market_state_enabled
         else None
     )
+    if (
+        btc_market_state is not None
+        and btc_market_state.onchain is not None
+        and "coinmetrics_timeout" in btc_market_state.onchain.errors
+    ):
+        network_counters["coinmetrics_timeout"] += 1
+    fast_context_news = rss_news + telegram_news + reddit_news + truth_news
+    if btc_market_state is not None and getattr(btc_market_state, "intraday", None) is not None:
+        attach_intraday_catalyst(btc_market_state.intraday, fast_context_news)
+
     market_state_news = (
         [market_state_to_news_item(btc_market_state)]
         if market_state_enabled and btc_market_state is not None
@@ -231,13 +244,8 @@ async def process_news():
         for item in market_state_news
         if item is not None
     ]
-    if (
-        btc_market_state is not None
-        and btc_market_state.onchain is not None
-        and "coinmetrics_timeout" in btc_market_state.onchain.errors
-    ):
-        network_counters["coinmetrics_timeout"] += 1
-    noticias = rss_news + telegram_news + reddit_news + truth_news
+
+    noticias = list(fast_context_news)
     noticias.extend(market_state_news)
     collected_total = len(noticias)
     noticias, intake_stats = seen_cache.filter_new_items(noticias)
@@ -406,19 +414,31 @@ async def process_news():
         noticias,
         {"ok": True, "errors": []},
     )
+    intraday_pre, intraday_pre_results, intraday_pre_counters = apply_intraday_publication_gate(
+        noticias,
+        {"ok": True, "errors": []},
+    )
     normal_links = {item.link for item in normal_pre}
     noticias = normal_pre + [
         item
         for item in rumor_pre
         if item.link not in normal_links
     ]
+    pre_links = {item.link for item in noticias}
+    noticias.extend(
+        item
+        for item in intraday_pre
+        if item.link not in pre_links
+    )
     normal_pass_links = {result.item.link for result in pre_gate_results if result.passed}
     pre_gate_results = pre_gate_results + [
         result
         for result in rumor_pre_results
         if result.passed and result.item.link not in normal_pass_links
     ]
+    pre_gate_results.extend(intraday_pre_results)
     discard_counters.update(pre_gate_counters)
+    discard_counters.update(intraday_pre_counters)
 
     if not noticias:
         funnel["reviewer_pass"] = False
@@ -475,19 +495,31 @@ async def process_news():
         noticias,
         revision,
     )
+    intraday_publishable, intraday_final_results, intraday_final_counters = apply_intraday_publication_gate(
+        noticias,
+        revision,
+    )
     normal_links = {item.link for item in normal_publishable}
     publishable = normal_publishable + [
         item
         for item in rumor_publishable
         if item.link not in normal_links
     ]
+    publishable_links = {item.link for item in publishable}
+    publishable.extend(
+        item
+        for item in intraday_publishable
+        if item.link not in publishable_links
+    )
     normal_pass_links = {result.item.link for result in final_gate_results if result.passed}
     final_gate_results = final_gate_results + [
         result
         for result in rumor_final_results
         if result.passed and result.item.link not in normal_pass_links
     ]
+    final_gate_results.extend(intraday_final_results)
     discard_counters.update(final_gate_counters)
+    discard_counters.update(intraday_final_counters)
 
     if not publishable:
         funnel["would_publish"] = 0

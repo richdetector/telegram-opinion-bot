@@ -243,10 +243,14 @@ class SeenCache:
                     last_seen_entry_id TEXT,
                     last_seen_published TEXT,
                     last_success TEXT,
-                    latest_urls TEXT
+                    latest_urls TEXT,
+                    consecutive_failures INTEGER DEFAULT 0,
+                    backoff_until TEXT
                 )
                 """
             )
+            self._ensure_column(conn, "source_state", "consecutive_failures", "INTEGER DEFAULT 0")
+            self._ensure_column(conn, "source_state", "backoff_until", "TEXT")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS source_stats (
@@ -288,6 +292,14 @@ class SeenCache:
                 """
             )
 
+    def _ensure_column(self, conn, table, column, definition):
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def close(self):
         return None
 
@@ -303,16 +315,92 @@ class SeenCache:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO source_state(source, last_seen_entry_id, last_seen_published, last_success, latest_urls)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO source_state(
+                    source,
+                    last_seen_entry_id,
+                    last_seen_published,
+                    last_success,
+                    latest_urls,
+                    consecutive_failures,
+                    backoff_until
+                )
+                VALUES (?, ?, ?, ?, ?, 0, '')
                 ON CONFLICT(source) DO UPDATE SET
                     last_seen_entry_id=excluded.last_seen_entry_id,
                     last_seen_published=excluded.last_seen_published,
                     last_success=excluded.last_success,
-                    latest_urls=excluded.latest_urls
+                    latest_urls=excluded.latest_urls,
+                    consecutive_failures=0,
+                    backoff_until=''
                 """,
                 (source, str(entry_id or ""), str(published or ""), _utc_now(), latest_urls or ""),
             )
+
+    def mark_source_failure(self, source, backoff_after=3, backoff_minutes=60):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT consecutive_failures FROM source_state WHERE source = ?",
+                (source,),
+            ).fetchone()
+            failures = int(row["consecutive_failures"] or 0) + 1 if row else 1
+            backoff_until = ""
+            if failures >= backoff_after:
+                backoff_until = (
+                    datetime.now(timezone.utc) + timedelta(minutes=backoff_minutes)
+                ).isoformat(timespec="seconds")
+            conn.execute(
+                """
+                INSERT INTO source_state(
+                    source,
+                    last_seen_entry_id,
+                    last_seen_published,
+                    last_success,
+                    latest_urls,
+                    consecutive_failures,
+                    backoff_until
+                )
+                VALUES (?, '', '', '', '', ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                    consecutive_failures=?,
+                    backoff_until=?
+                """,
+                (source, failures, backoff_until, failures, backoff_until),
+            )
+
+    def mark_source_success(self, source):
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO source_state(
+                    source,
+                    last_seen_entry_id,
+                    last_seen_published,
+                    last_success,
+                    latest_urls,
+                    consecutive_failures,
+                    backoff_until
+                )
+                VALUES (?, '', '', ?, '', 0, '')
+                ON CONFLICT(source) DO UPDATE SET
+                    last_success=?,
+                    consecutive_failures=0,
+                    backoff_until=''
+                """,
+                (source, _utc_now(), _utc_now()),
+            )
+
+    def source_in_backoff(self, source):
+        state = self.get_source_state(source)
+        backoff_until = state.get("backoff_until")
+        if not backoff_until:
+            return False
+        try:
+            until = datetime.fromisoformat(backoff_until)
+        except ValueError:
+            return False
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return until > datetime.now(timezone.utc)
 
     def increment_source(self, source, field, amount=1):
         allowed = {

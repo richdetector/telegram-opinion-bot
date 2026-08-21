@@ -2,6 +2,8 @@ import sys
 import time
 import tempfile
 import unittest
+import io
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -27,6 +29,14 @@ from liquidity_structure_engine import (
     BtcLiquidityStructureSnapshot,
     LiquidityCluster,
 )
+from intraday_engine import (
+    BtcIntradaySnapshot,
+    IntradayLiquidityMap,
+    analyze_btc_intraday_state,
+    attach_intraday_catalyst,
+    intraday_state_to_news_item,
+)
+from intraday_publication_gate import evaluate_intraday_item
 from main import (
     _preselect_market_candidates,
     _revalidate_precandidates_after_download,
@@ -174,6 +184,66 @@ def quiet_btc_state(
         confluence_score=10,
         market_regime="NEUTRAL",
         summary="NO MATERIAL BTC MARKET ANOMALY",
+    )
+
+
+def intraday_snapshot(
+    change_1h=0.4,
+    change_15m=0.1,
+    change_4h=0.8,
+    volume_ratio=1.0,
+    volatility_ratio=1.0,
+    oi_change=0.0,
+    funding=0.0001,
+    structure_15m="RANGE",
+    structure_1h="RANGE",
+    structure_4h="RANGE",
+    age=0.0,
+):
+    liquidity = IntradayLiquidityMap(
+        visible_above="ORDER_BOOK_VISIBLE",
+        visible_below="ORDER_BOOK_VISIBLE",
+        nearest_visible_above=101000,
+        nearest_visible_below=99000,
+        equal_highs=101000,
+        equal_lows=99000,
+        previous_day_high=100800,
+        previous_day_low=99050,
+    )
+    return BtcIntradaySnapshot(
+        price=100000,
+        price_change_5m=change_15m / 3,
+        price_change_15m=change_15m,
+        price_change_30m=change_15m * 1.4,
+        price_change_1h=change_1h,
+        price_change_4h=change_4h,
+        price_change_24h=change_4h * 2,
+        volume_15m=100,
+        volume_1h=500,
+        volume_4h=1500,
+        volume_ratio_15m=volume_ratio,
+        volume_ratio_1h=volume_ratio,
+        volume_ratio_4h=max(1.0, volume_ratio * 0.8),
+        realized_volatility_15m=abs(change_15m),
+        realized_volatility_1h=abs(change_1h),
+        realized_volatility_4h=abs(change_4h),
+        volatility_ratio_15m=volatility_ratio,
+        volatility_ratio_1h=volatility_ratio,
+        volatility_ratio_4h=max(1.0, volatility_ratio * 0.8),
+        open_interest=1_000_000,
+        oi_change_15m=oi_change / 2,
+        oi_change_1h=oi_change,
+        oi_change_4h=oi_change * 1.5,
+        funding_rate=funding,
+        funding_change=0.0,
+        funding_regime="POSITIVE" if funding > 0 else "NEGATIVE",
+        structure_15m=structure_15m,
+        structure_1h=structure_1h,
+        structure_4h=structure_4h,
+        structure_1d="RANGE",
+        liquidity=liquidity,
+        market_data_age_minutes=age,
+        timestamp="2026-08-19T20:00:00+00:00",
     )
 
 
@@ -561,7 +631,8 @@ class MarketIntelligenceTests(unittest.TestCase):
         state = analyze_btc_market_snapshot(BtcMarketSnapshot())
 
         self.assertEqual(state.signals, [])
-        self.assertEqual(state.summary, "NO MATERIAL BTC MARKET ANOMALY")
+        self.assertEqual(state.summary, "BTC MARKET STATE: INSUFFICIENT DATA")
+        self.assertEqual(state.status, "INSUFFICIENT")
         self.assertIsNone(market_state_to_news_item(state))
 
     def test_market_data_api_down_keeps_engine_alive(self):
@@ -572,6 +643,68 @@ class MarketIntelligenceTests(unittest.TestCase):
 
         self.assertIn("market_data:RuntimeError", state.snapshot.errors)
         self.assertEqual(state.confluence, "LOW")
+        self.assertEqual(state.status, "INSUFFICIENT")
+
+    def test_market_data_partial_failure_is_degraded_not_insufficient(self):
+        state = fetch_btc_market_state(
+            fetcher=lambda: BtcMarketSnapshot(
+                price=100000,
+                price_change_1h=0.2,
+                price_change_24h=1.0,
+                volume_24h=10_000_000,
+                timestamp="2026-08-20T10:00:00+00:00",
+            ),
+            etf_fetcher=lambda: BtcEtfFlowSnapshot(status="NOT_CONFIGURED"),
+            onchain_fetcher=lambda: BtcOnchainSnapshot(errors=["coinmetrics_timeout"]),
+            sentiment_fetcher=lambda: BtcSentimentSnapshot(),
+            liquidity_fetcher=lambda: BtcLiquidityStructureSnapshot(errors=["depth:TimeoutError"]),
+            intraday_fetcher=lambda liquidity_structure=None: BtcIntradaySnapshot(
+                price=100000,
+                price_change_5m=0.1,
+                price_change_15m=0.3,
+                price_change_30m=0.5,
+                price_change_1h=1.0,
+                price_change_4h=1.2,
+                price_change_24h=2.0,
+                volume_15m=100,
+                volume_1h=500,
+                volume_4h=1500,
+                volume_ratio_1h=2.0,
+                realized_volatility_1h=1.0,
+                volatility_ratio_1h=1.2,
+                open_interest=1_000_000,
+                oi_change_1h=0.5,
+                funding_rate=0.0001,
+                funding_regime="POSITIVE",
+                structure_15m="RANGE",
+                structure_1h="RANGE",
+                structure_4h="RANGE",
+                liquidity=IntradayLiquidityMap(),
+                market_data_age_minutes=0,
+                timestamp="2026-08-20T10:00:00+00:00",
+                errors=["order_book:TimeoutError"],
+            ),
+        )
+
+        self.assertEqual(state.status, "DEGRADED")
+        self.assertEqual(state.intraday.status, "DEGRADED")
+        self.assertNotEqual(state.intraday.decision, "INSUFFICIENT_DATA")
+
+    def test_market_report_does_not_print_no_anomaly_for_insufficient_data(self):
+        from dry_run_report import print_btc_market_state
+
+        state = BtcMarketState(
+            snapshot=BtcMarketSnapshot(errors=["ticker_24h:TimeoutError"]),
+            status="INSUFFICIENT",
+            summary="BTC MARKET STATE: INSUFFICIENT DATA",
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            print_btc_market_state(state)
+
+        text = output.getvalue()
+        self.assertIn("BTC MARKET STATE: INSUFFICIENT DATA", text)
+        self.assertNotIn("NO MATERIAL BTC MARKET ANOMALY", text)
 
     def test_market_state_never_produces_buy_sell_language(self):
         state = analyze_btc_market_snapshot(
@@ -1949,6 +2082,298 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertEqual(counters["pre_candidate_medium_rejected"], 1)
         self.assertEqual(counters["pre_candidate_rumor_rejected"], 1)
 
+    def test_intraday_small_move_normal_vol_no_alert(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.5, volume_ratio=1.0, volatility_ratio=1.0)
+        )
+
+        self.assertEqual(state.decision, "NO_INTRADAY_ALERT")
+        self.assertEqual(state.intraday_materiality, "INTRADAY_LOW")
+
+    def test_intraday_missing_core_is_insufficient(self):
+        state = analyze_btc_intraday_state(
+            BtcIntradaySnapshot(
+                funding_rate=0.0001,
+                errors=["klines_5m:TimeoutError"],
+            )
+        )
+
+        self.assertEqual(state.status, "INSUFFICIENT")
+        self.assertEqual(state.decision, "INSUFFICIENT_DATA")
+        self.assertIsNone(intraday_state_to_news_item(state))
+
+    def test_intraday_core_ok_optional_missing_is_degraded(self):
+        snapshot = intraday_snapshot(change_1h=2.0, change_15m=0.8, volume_ratio=2.0)
+        snapshot.open_interest = None
+        snapshot.oi_change_1h = None
+        snapshot.funding_rate = None
+        snapshot.funding_regime = "UNKNOWN"
+        snapshot.errors = ["open_interest:TimeoutError", "funding:TimeoutError"]
+
+        state = analyze_btc_intraday_state(snapshot)
+
+        self.assertEqual(state.status, "DEGRADED")
+        self.assertNotEqual(state.decision, "INSUFFICIENT_DATA")
+
+    def test_intraday_order_book_timeout_still_analyzes_price_action(self):
+        snapshot = intraday_snapshot(
+            change_1h=3.0,
+            change_15m=1.0,
+            volume_ratio=2.4,
+            volatility_ratio=2.0,
+            oi_change=3.0,
+        )
+        snapshot.liquidity = IntradayLiquidityMap()
+        snapshot.errors = ["liquidity_structure:TimeoutError"]
+
+        state = analyze_btc_intraday_state(snapshot)
+        names = {signal.name for signal in state.signals}
+
+        self.assertEqual(state.status, "DEGRADED")
+        self.assertIn("PRICE_ACCELERATION_UP", names)
+        self.assertIn("VOLUME_EXPANSION", names)
+
+    def test_intraday_fast_move_normal_volume_is_not_high_automatically(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.0, change_15m=0.6, volume_ratio=1.0, volatility_ratio=1.2)
+        )
+
+        self.assertNotEqual(state.intraday_materiality, "INTRADAY_HIGH")
+
+    def test_intraday_up_three_percent_volume_and_oi_is_high_candidate(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(
+                change_1h=3.0,
+                change_15m=1.1,
+                volume_ratio=2.4,
+                volatility_ratio=2.1,
+                oi_change=3.0,
+                structure_1h="BULLISH_BREAKOUT",
+            )
+        )
+
+        self.assertEqual(state.decision, "INTRADAY_CANDIDATE")
+        self.assertIn(state.intraday_materiality, {"INTRADAY_HIGH", "INTRADAY_CRITICAL"})
+
+    def test_intraday_down_four_percent_oi_collapse_is_deleveraging_candidate(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=-4.0, change_15m=-1.5, volume_ratio=2.2, volatility_ratio=2.5, oi_change=-4.0)
+        )
+        names = {signal.name for signal in state.signals}
+
+        self.assertIn("DELEVERAGING_STYLE_MOVE", names)
+        self.assertEqual(state.decision, "INTRADAY_CANDIDATE")
+
+    def test_intraday_up_four_percent_oi_falling_is_short_covering_inference(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=4.0, change_15m=1.6, volume_ratio=2.1, volatility_ratio=2.0, oi_change=-3.0)
+        )
+        names = {signal.name for signal in state.signals}
+
+        self.assertIn("POSSIBLE_SHORT_COVERING", names)
+
+    def test_intraday_up_four_percent_oi_rising_is_momentum_leverage_inference(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=4.0, change_15m=1.6, volume_ratio=2.1, volatility_ratio=2.0, oi_change=3.0)
+        )
+        names = {signal.name for signal in state.signals}
+
+        self.assertIn("MOMENTUM_WITH_LEVERAGE_BUILDUP", names)
+
+    def test_intraday_fast_move_without_news_can_publish_no_clear_catalyst(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.5, change_15m=1.2, volume_ratio=2.3, volatility_ratio=2.2, oi_change=3.0)
+        )
+        news = intraday_state_to_news_item(state)
+
+        self.assertIsNotNone(news)
+        self.assertIn("Catalizador: NO_CLEAR_CATALYST", news.content)
+
+    def test_intraday_news_exists_but_causality_uncertain_possible_catalyst(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.5, change_15m=1.2, volume_ratio=2.3, volatility_ratio=2.2, oi_change=3.0)
+        )
+        fast = item("BTC rumor about exchange outage", source="binancekillers")
+        fast.source_type = "FAST"
+
+        attach_intraday_catalyst(state, [fast])
+
+        self.assertEqual(state.catalyst_status, "POSSIBLE_CATALYST")
+
+    def test_intraday_primary_news_is_confirmed_catalyst(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.5, change_15m=1.2, volume_ratio=2.3, volatility_ratio=2.2, oi_change=3.0)
+        )
+        primary = item("SEC confirms Bitcoin ETF emergency decision", source="SEC - Press Releases")
+        primary.source_type = "PRIMARY"
+
+        attach_intraday_catalyst(state, [primary])
+
+        self.assertEqual(state.catalyst_status, "CONFIRMED_CATALYST")
+
+    def test_intraday_structural_low_intraday_high_can_reach_gate(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.5, change_15m=1.2, volume_ratio=2.3, volatility_ratio=2.2, oi_change=3.0)
+        )
+        news = intraday_state_to_news_item(state)
+        result = evaluate_intraday_item(news, review_ok=True)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(news.event_type, "BTC_INTRADAY_MOVE")
+
+    def test_intraday_no_buy_sell_language(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.5, change_15m=1.2, volume_ratio=2.3, volatility_ratio=2.2, oi_change=3.0)
+        )
+        news = intraday_state_to_news_item(state)
+        lowered = news.content.lower()
+
+        self.assertNotIn("buy", lowered)
+        self.assertNotIn("sell", lowered)
+        self.assertNotIn("long now", lowered)
+        self.assertNotIn("short now", lowered)
+
+    def test_intraday_stale_market_data_rejected(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.5, change_15m=1.2, volume_ratio=2.3, volatility_ratio=2.2, oi_change=3.0)
+        )
+        news = intraday_state_to_news_item(state)
+        news.intelligence_summary["MARKET_DATA_AGE_MINUTES"] = 30
+        result = evaluate_intraday_item(news, review_ok=True)
+
+        self.assertFalse(result.passed)
+        self.assertIn("stale_market_data", result.reasons)
+
+    def test_intraday_equal_highs_visible_ask_liquidity_cluster_above(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.0, volume_ratio=2.0, volatility_ratio=2.0, oi_change=3.0)
+        )
+        names = {signal.name for signal in state.signals}
+
+        self.assertIn("LIQUIDITY_CLUSTER_ABOVE", names)
+        self.assertIn("EQUAL_HIGHS_LIQUIDITY", names)
+
+    def test_intraday_equal_highs_without_book_is_inferred_liquidity(self):
+        snapshot = intraday_snapshot(change_1h=3.0, change_15m=1.0, volume_ratio=2.0, volatility_ratio=2.0, oi_change=3.0)
+        snapshot.liquidity.visible_above = "UNKNOWN"
+        snapshot.liquidity.nearest_visible_above = None
+        state = analyze_btc_intraday_state(snapshot)
+        signal = [signal for signal in state.signals if signal.name == "EQUAL_HIGHS_LIQUIDITY"][0]
+
+        self.assertEqual(signal.certainty, "INFERRED")
+
+    def test_intraday_sweep_above_return_to_range_signal(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.5, change_15m=1.0, volume_ratio=2.0, volatility_ratio=2.0, oi_change=2.5, structure_1h="FAILED_BREAKOUT_UP")
+        )
+        names = {signal.name for signal in state.signals}
+
+        self.assertIn("POSSIBLE_LIQUIDITY_SWEEP_ABOVE", names)
+
+    def test_intraday_bos_without_volume_is_weak(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=1.0, change_15m=0.4, volume_ratio=1.0, volatility_ratio=1.0, oi_change=0.5, structure_1h="BULLISH_BREAKOUT")
+        )
+
+        self.assertNotEqual(state.decision, "INTRADAY_CANDIDATE")
+
+    def test_intraday_bos_volume_oi_strengthens_smc(self):
+        weak = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.0, change_15m=0.7, volume_ratio=1.0, volatility_ratio=1.0, oi_change=0.5, structure_1h="BULLISH_BREAKOUT")
+        )
+        strong = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.0, volume_ratio=2.4, volatility_ratio=2.0, oi_change=3.0, structure_1h="BULLISH_BREAKOUT")
+        )
+
+        self.assertGreater(strong.smc_confluence_score, weak.smc_confluence_score)
+
+    def test_intraday_mixed_timeframe_output(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.0, volume_ratio=2.4, volatility_ratio=2.0, oi_change=3.0, structure_15m="BULLISH", structure_1h="BULLISH_BREAKOUT", structure_4h="RANGE")
+        )
+        news = intraday_state_to_news_item(state)
+
+        self.assertIn("15m=BULLISH", news.content)
+        self.assertIn("4h=RANGE", news.content)
+
+    def test_intraday_smc_only_cannot_create_high_alert(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.3, change_15m=0.1, volume_ratio=1.0, volatility_ratio=1.0, oi_change=0.0, structure_1h="BULLISH_BREAKOUT")
+        )
+
+        self.assertNotEqual(state.decision, "INTRADAY_CANDIDATE")
+
+    def test_intraday_smc_abnormal_move_derivatives_volume_can_elevate(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.2, change_15m=1.1, volume_ratio=2.5, volatility_ratio=2.2, oi_change=3.2, structure_1h="BULLISH_BREAKOUT")
+        )
+
+        self.assertEqual(state.decision, "INTRADAY_CANDIDATE")
+
+    def test_intraday_publication_can_include_editorial_question_without_certainty(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.2, change_15m=1.1, volume_ratio=2.5, volatility_ratio=2.2, oi_change=3.2)
+        )
+        news = intraday_state_to_news_item(state)
+
+        self.assertIn("Pregunta clave", news.content)
+        self.assertIn("¿", news.content)
+        self.assertNotIn("confirmado que alcanzará", news.content.lower())
+
+    def test_intraday_no_institutional_manipulation_claims(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.2, change_15m=1.1, volume_ratio=2.5, volatility_ratio=2.2, oi_change=3.2, structure_1h="FAILED_BREAKOUT_UP")
+        )
+        news = intraday_state_to_news_item(state)
+        lowered = news.content.lower()
+
+        self.assertNotIn("instituciones están cazando stops", lowered)
+        self.assertNotIn("manipulando btc", lowered)
+        self.assertNotIn("market makers van a barrer", lowered)
+
+    def test_intraday_no_fake_liquidation_heatmap(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=-3.2, change_15m=-1.1, volume_ratio=2.5, volatility_ratio=2.2, oi_change=-3.2)
+        )
+        news = intraday_state_to_news_item(state)
+
+        self.assertNotIn("heatmap", news.content.lower())
+
+    def test_intraday_same_movement_dedupes_by_event_fingerprint(self):
+        cache = temp_seen_cache()
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.2, change_15m=1.1, volume_ratio=2.5, volatility_ratio=2.2, oi_change=3.2)
+        )
+        first = intraday_state_to_news_item(state)
+        second = intraday_state_to_news_item(state)
+        second.link = "market-state:btc-intraday:UP:BULLISH:later"
+
+        accepted_first, _ = cache.filter_new_items([first])
+        accepted_second, stats = cache.filter_new_items([second])
+
+        self.assertEqual(len(accepted_first), 1)
+        self.assertEqual(accepted_second, [])
+        self.assertGreaterEqual(stats.same_event_merges + stats.near_duplicates, 1)
+
+    def test_quiet_market_cannot_override_strong_intraday_movement(self):
+        intraday = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.2, change_15m=1.1, volume_ratio=2.5, volatility_ratio=2.2, oi_change=3.2)
+        )
+        market_state = BtcMarketState(
+            snapshot=BtcMarketSnapshot(timestamp="2026-08-19T20:00:00+00:00"),
+            intraday=intraday,
+            confluence="LOW",
+            confluence_score=0,
+            market_regime="NEUTRAL",
+        )
+
+        news = market_state_to_news_item(market_state)
+        quiet = evaluate_quiet_market(quiet_btc_state(), has_market_alert=news is not None, history=[])
+
+        self.assertIsNotNone(news)
+        self.assertFalse(quiet.passed)
+        self.assertEqual(quiet.skipped, "market_alert_priority")
+
     def test_quiet_btc_half_percent_for_few_hours_no_note(self):
         now = datetime(2026, 8, 16, 12, 0)
         history = [
@@ -2440,6 +2865,61 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertEqual(news, [])
         self.assertEqual(cache.source_performance()[0]["errors"], 1)
 
+    def test_rss_partial_feed_timeout_keeps_valid_results(self):
+        import collector
+        import feedparser
+
+        ok_feed = b"""
+        <rss><channel>
+        <item><title>Fed cuts rates unexpectedly</title><link>https://ok.example.com/1</link><guid>1</guid></item>
+        </channel></rss>
+        """
+
+        def fake_fetch_feed(feed_info):
+            if feed_info["name"] == "Slow RSS":
+                raise TimeoutError("feed timeout")
+            return feed_info, feedparser.parse(ok_feed)
+
+        cache = temp_seen_cache()
+        feeds = [
+            {"name": f"OK RSS {idx}", "url": f"https://ok.example.com/{idx}"}
+            for idx in range(10)
+        ] + [{"name": "Slow RSS", "url": "https://slow.example.com"}]
+        with patch.object(collector, "RSS_FEEDS", feeds), \
+            patch.object(collector, "_fetch_feed", side_effect=fake_fetch_feed):
+            news = collector.get_news(seen_cache=cache, max_workers=4)
+
+        self.assertEqual(len(news), 1)
+        self.assertEqual(news[0].title, "Fed cuts rates unexpectedly")
+        self.assertEqual(cache.get_source_state("Slow RSS")["consecutive_failures"], 1)
+
+    def test_repeated_broken_rss_enters_backoff_and_recovers(self):
+        import collector
+        import feedparser
+
+        cache = temp_seen_cache()
+        feed = [{"name": "TreasuryDirect - Auction Results", "url": "https://broken.example.com"}]
+        with patch.object(collector, "RSS_FEEDS", feed), \
+            patch.object(collector, "_fetch_feed", side_effect=TimeoutError("timeout")):
+            collector.get_news(seen_cache=cache)
+            collector.get_news(seen_cache=cache)
+            collector.get_news(seen_cache=cache)
+
+        self.assertTrue(cache.source_in_backoff("TreasuryDirect - Auction Results"))
+
+        recovered_feed = b"""
+        <rss><channel>
+        <item><title>Treasury auction result</title><link>https://treasury.example.com/1</link><guid>1</guid></item>
+        </channel></rss>
+        """
+        cache.mark_source_success("TreasuryDirect - Auction Results")
+        with patch.object(collector, "RSS_FEEDS", feed), \
+            patch.object(collector, "_fetch_feed", return_value=(feed[0], feedparser.parse(recovered_feed))):
+            news = collector.get_news(seen_cache=cache)
+
+        self.assertFalse(cache.source_in_backoff("TreasuryDirect - Auction Results"))
+        self.assertEqual(len(news), 1)
+
     def test_sync_phase_timeout_returns_fallback(self):
         def hanging_call():
             time.sleep(0.05)
@@ -2461,7 +2941,7 @@ class MarketIntelligenceTests(unittest.TestCase):
             time.sleep(0.05)
             return [publishable_item()]
 
-        with patch("main.RSS_TIMEOUT_SECONDS", 0.01), \
+        with patch("main.RSS_PHASE_TIMEOUT_SECONDS", 0.01), \
             patch("main.get_news", side_effect=hanging_rss), \
             patch("main.get_telegram_news", new_callable=AsyncMock, return_value=[]), \
             patch("main.get_reddit_news", return_value=([], RedditStatus(status="NOT_CONFIGURED"))), \
@@ -2496,7 +2976,7 @@ class MarketIntelligenceTests(unittest.TestCase):
             time.sleep(0.05)
             return None
 
-        with patch("main.MARKET_DATA_TIMEOUT_SECONDS", 0.01), \
+        with patch("main.MARKET_DATA_PHASE_TIMEOUT_SECONDS", 0.01), \
             patch("main.get_news", return_value=[]), \
             patch("main.get_telegram_news", new_callable=AsyncMock, return_value=[]), \
             patch("main.get_reddit_news", return_value=([], RedditStatus(status="NOT_CONFIGURED"))), \

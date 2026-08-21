@@ -1,5 +1,6 @@
 import feedparser
 import trafilatura
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from socket import timeout as SocketTimeout
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -14,6 +15,7 @@ MAX_CONTENT_LENGTH = 3000
 FEED_REQUEST_HEADERS = {
     "User-Agent": "RadarMarketIntelligence/1.0 (+https://example.com; RSS health check)"
 }
+RSS_MAX_WORKERS = 6
 
 
 def _is_timeout_exception(exc):
@@ -74,73 +76,110 @@ def extract_content(url, diagnostics=None):
         return ""
 
 
-def get_news(limit_per_feed=10, diagnostics=None, seen_cache=None):
+def _fetch_feed(feed_info):
+    payload = _fetch_bytes(
+        feed_info["url"],
+        timeout=RSS_TIMEOUT_SECONDS,
+        headers=FEED_REQUEST_HEADERS,
+    )
+    return feed_info, feedparser.parse(payload)
 
+
+def _news_from_feed(feed_info, feed, limit_per_feed, seen_cache, seen_links):
     news = []
+    source_state = seen_cache.get_source_state(feed_info["name"]) if seen_cache else {}
+    last_seen_entry_id = source_state.get("last_seen_entry_id", "")
+    newest_entry_id = ""
+    newest_published = ""
+    latest_urls = []
 
-    seen_links = set()
+    for entry in feed.entries[:limit_per_feed]:
 
-    for feed_info in RSS_FEEDS:
+        link = getattr(entry, "link", "").strip()
+        entry_id = (getattr(entry, "id", "") or link).strip()
 
-        try:
-            payload = _fetch_bytes(
-                feed_info["url"],
-                timeout=RSS_TIMEOUT_SECONDS,
-                headers=FEED_REQUEST_HEADERS,
-            )
-            feed = feedparser.parse(payload)
-        except Exception as exc:
-            if diagnostics is not None and _is_timeout_exception(exc):
-                diagnostics["rss_timeout"] += 1
-                if seen_cache:
-                    seen_cache.increment_source(feed_info["name"], "timeouts")
-            elif seen_cache:
-                seen_cache.increment_source(feed_info["name"], "errors")
-            print(f"⚠️ RSS {feed_info['name']}: {type(exc).__name__}", flush=True)
+        if not link:
+            continue
+        if not newest_entry_id:
+            newest_entry_id = entry_id
+            newest_published = getattr(entry, "published", "").strip()
+        latest_urls.append(link)
+        if last_seen_entry_id and entry_id == last_seen_entry_id:
+            break
+
+        if link in seen_links:
             continue
 
-        source_state = seen_cache.get_source_state(feed_info["name"]) if seen_cache else {}
-        last_seen_entry_id = source_state.get("last_seen_entry_id", "")
-        newest_entry_id = ""
-        newest_published = ""
-        latest_urls = []
+        seen_links.add(link)
 
-        for entry in feed.entries[:limit_per_feed]:
+        item = NewsItem(
+            title=getattr(entry, "title", "").strip(),
+            summary=getattr(entry, "summary", "").strip(),
+            content="",
+            link=link,
+            published=getattr(entry, "published", "").strip(),
+            source=feed_info["name"],
+        )
 
-            link = getattr(entry, "link", "").strip()
-            entry_id = (getattr(entry, "id", "") or link).strip()
+        news.append(apply_source_metadata(item))
 
-            if not link:
-                continue
-            if not newest_entry_id:
-                newest_entry_id = entry_id
-                newest_published = getattr(entry, "published", "").strip()
-            latest_urls.append(link)
-            if last_seen_entry_id and entry_id == last_seen_entry_id:
-                break
-
-            if link in seen_links:
-                continue
-
-            seen_links.add(link)
-
-            item = NewsItem(
-                title=getattr(entry, "title", "").strip(),
-                summary=getattr(entry, "summary", "").strip(),
-                content="",
-                link=link,
-                published=getattr(entry, "published", "").strip(),
-                source=feed_info["name"],
-            )
-
-            news.append(apply_source_metadata(item))
-
-        if seen_cache and newest_entry_id:
+    if seen_cache:
+        if newest_entry_id:
             seen_cache.update_source_state(
                 feed_info["name"],
                 entry_id=newest_entry_id,
                 published=newest_published,
                 latest_urls=",".join(latest_urls[:20]),
+            )
+        else:
+            seen_cache.mark_source_success(feed_info["name"])
+
+    return news
+
+
+def get_news(limit_per_feed=10, diagnostics=None, seen_cache=None, max_workers=RSS_MAX_WORKERS):
+
+    news = []
+
+    seen_links = set()
+    feed_jobs = []
+
+    for feed_info in RSS_FEEDS:
+        if seen_cache and seen_cache.source_in_backoff(feed_info["name"]):
+            continue
+        feed_jobs.append(feed_info)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_feed, feed_info): feed_info
+            for feed_info in feed_jobs
+        }
+
+        for future in as_completed(futures):
+            feed_info = futures[future]
+
+            try:
+                _, feed = future.result()
+            except Exception as exc:
+                if diagnostics is not None and _is_timeout_exception(exc):
+                    diagnostics["rss_timeout"] += 1
+                    if seen_cache:
+                        seen_cache.increment_source(feed_info["name"], "timeouts")
+                elif seen_cache:
+                    seen_cache.increment_source(feed_info["name"], "errors")
+                if seen_cache:
+                    seen_cache.mark_source_failure(feed_info["name"])
+                print(f"⚠️ RSS {feed_info['name']}: {type(exc).__name__}", flush=True)
+                continue
+
+            news.extend(
+                _news_from_feed(
+                    feed_info,
+                    feed,
+                    limit_per_feed,
+                    seen_cache,
+                    seen_links,
+                )
             )
 
     return news

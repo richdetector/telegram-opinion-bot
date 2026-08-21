@@ -1,5 +1,13 @@
 from dataclasses import dataclass, field
 
+from config import INTRADAY_ENGINE_ENABLED
+from intraday_engine import (
+    BtcIntradaySnapshot,
+    BtcIntradayState,
+    analyze_btc_intraday_state,
+    fetch_btc_intraday_snapshot,
+    intraday_state_to_news_item,
+)
 from market_data import (
     BtcEtfFlowSnapshot,
     BtcMarketSnapshot,
@@ -34,6 +42,7 @@ class MarketSignal:
 @dataclass
 class BtcMarketState:
     snapshot: BtcMarketSnapshot
+    intraday: BtcIntradayState | None = None
     etf_flows: BtcEtfFlowSnapshot | None = None
     onchain: BtcOnchainSnapshot | None = None
     sentiment: BtcSentimentSnapshot | None = None
@@ -44,6 +53,7 @@ class BtcMarketState:
     market_regime: str = "UNKNOWN"
     onchain_regime: str = "UNKNOWN"
     summary: str = "NO MATERIAL BTC MARKET ANOMALY"
+    status: str = "UNKNOWN"
 
 
 def _add_signal(signals, name, strength, certainty, evidence, timestamp="", source=""):
@@ -289,6 +299,31 @@ def _analyze_liquidity_structure_signals(liquidity_structure):
 
 def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None, sentiment=None, liquidity_structure=None):
     signals = []
+    core_available = any(
+        value is not None
+        for value in [
+            snapshot.price,
+            snapshot.price_change_1h,
+            snapshot.price_change_24h,
+            snapshot.volume_24h,
+            snapshot.volume_zscore,
+            snapshot.open_interest,
+            snapshot.open_interest_change,
+            snapshot.funding_rate,
+            snapshot.volatility,
+            snapshot.volatility_zscore,
+            snapshot.liquidations_long,
+            snapshot.liquidations_short,
+            snapshot.liquidations_total,
+        ]
+    )
+    optional_errors = bool(
+        snapshot.errors
+        or getattr(etf_flows, "errors", None)
+        or getattr(onchain, "errors", None)
+        or getattr(sentiment, "errors", None)
+        or getattr(liquidity_structure, "errors", None)
+    )
 
     if snapshot.open_interest_change is not None:
         if snapshot.open_interest_change >= 8:
@@ -552,58 +587,76 @@ def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None, sentiment=N
 
     signal_names = {signal.name for signal in signals}
 
-    if "DELEVERAGING" in signal_names:
+    if not core_available:
+        confluence = "LOW"
+        regime = "UNKNOWN"
+        summary = "BTC MARKET STATE: INSUFFICIENT DATA"
+        status = "INSUFFICIENT"
+    elif "DELEVERAGING" in signal_names:
         confluence = "HIGH"
         regime = "DELEVERAGING"
         summary = "BTC derivatives show a deleveraging candidate."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "LEVERAGE_BUILDUP" in signal_names:
         confluence = "HIGH"
         regime = "LEVERAGED"
         summary = "BTC positioning shows leverage buildup; risk of disorderly deleveraging is elevated."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "INSTITUTIONAL_DEMAND_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "INSTITUTIONAL_FLOW_POSITIVE"
         summary = "BTC ETF flows and market participation show positive institutional-flow confluence."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "DISTRIBUTION_RISK_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "DISTRIBUTION_RISK"
         summary = "BTC ETF outflows and positioning show elevated distribution/deleveraging risk."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "CUSTODY_SUPPLY_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "ACCUMULATION_CONSISTENT"
         summary = "BTC ETF and on-chain flows are consistent with reduced exchange supply, without proving accumulation."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "ONCHAIN_DISTRIBUTION_RISK_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "DISTRIBUTION_RISK"
         summary = "BTC on-chain exchange inflows and positioning show elevated distribution-risk confluence."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "CROWDING_RISK_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "CROWDED_POSITIONING"
         summary = "BTC sentiment and derivatives show crowded positioning risk; Radar does not infer direction deterministically."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "SENTIMENT_FLOW_DIVERGENCE_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "FLOW_SENTIMENT_DIVERGENCE"
         summary = "BTC flow proxies strengthen while retail sentiment is negative; this is a divergence, not a price signal."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "SENTIMENT_DISTRIBUTION_RISK_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "DISTRIBUTION_RISK"
         summary = "BTC retail optimism diverges from weaker flow proxies, raising crowding/distribution-risk context."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "STRUCTURE_CROWDING_RISK_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "STRUCTURE_CROWDING_RISK"
         summary = "BTC crowded positioning aligns with weaker liquidity/structure context; Radar treats this as risk context only."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif "CONSTRUCTIVE_STRUCTURE_FLOW_CONFLUENCE" in signal_names:
         confluence = "HIGH"
         regime = "CONSTRUCTIVE_FLOW_STRUCTURE"
         summary = "BTC flow proxies and market structure are constructively aligned without producing a trading recommendation."
+        status = "FULL" if not optional_errors else "DEGRADED"
     elif confluence_score >= 45 and len(signals) >= 2:
         confluence = "MEDIUM"
         regime = "HIGH_VOLATILITY"
         summary = "BTC market state shows notable but incomplete confluence."
+        status = "FULL" if not optional_errors else "DEGRADED"
     else:
         confluence = "LOW"
         regime = "NEUTRAL"
         summary = "NO MATERIAL BTC MARKET ANOMALY"
+        status = "FULL" if not optional_errors else "DEGRADED"
 
     return BtcMarketState(
         snapshot=snapshot,
@@ -617,12 +670,14 @@ def analyze_btc_market_state(snapshot, etf_flows=None, onchain=None, sentiment=N
         market_regime=regime,
         onchain_regime=_onchain_regime(signal_names),
         summary=summary,
+        status=status,
     )
 
 
 def market_state_to_news_item(state):
+    intraday_item = intraday_state_to_news_item(state.intraday)
     if state.confluence != "HIGH":
-        return None
+        return intraday_item
 
     signal_names = [signal.name for signal in state.signals]
 
@@ -679,6 +734,7 @@ def market_state_to_news_item(state):
 
 def fetch_btc_market_state(
     fetcher=fetch_btc_market_snapshot,
+    intraday_fetcher=fetch_btc_intraday_snapshot,
     etf_fetcher=fetch_btc_etf_flow_snapshot,
     onchain_fetcher=fetch_btc_onchain_snapshot,
     sentiment_fetcher=fetch_btc_sentiment_snapshot,
@@ -719,10 +775,27 @@ def fetch_btc_market_state(
             errors=[f"liquidity_structure:{type(exc).__name__}"]
         )
 
-    return analyze_btc_market_state(
+    state = analyze_btc_market_state(
         snapshot,
         etf_flows,
         onchain,
         sentiment,
         liquidity_structure,
     )
+
+    if INTRADAY_ENGINE_ENABLED:
+        try:
+            intraday_snapshot = intraday_fetcher(liquidity_structure=liquidity_structure)
+            state.intraday = analyze_btc_intraday_state(intraday_snapshot, liquidity_structure)
+        except Exception as exc:
+            state.intraday = BtcIntradayState(
+                snapshot=BtcIntradaySnapshot(
+                    timestamp=snapshot.timestamp,
+                    status="INSUFFICIENT",
+                    errors=[f"intraday:{type(exc).__name__}"],
+                ),
+                status="INSUFFICIENT",
+                decision="INSUFFICIENT_DATA",
+            )
+
+    return state

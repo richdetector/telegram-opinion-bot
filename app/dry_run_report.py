@@ -108,12 +108,19 @@ def print_btc_market_state(state):
     print("========================================")
 
     if state is None:
-        print("NO MATERIAL BTC MARKET ANOMALY")
+        print("BTC MARKET STATE: INSUFFICIENT DATA")
         print("========================================\n")
+        print_btc_intraday_state(None)
         return
 
     snapshot = state.snapshot
 
+    market_status = getattr(state, "status", "UNKNOWN")
+    print(f"Status:         {market_status}")
+    if market_status == "INSUFFICIENT":
+        print("BTC MARKET STATE: INSUFFICIENT DATA")
+    elif market_status == "DEGRADED":
+        print("BTC MARKET STATE: DEGRADED")
     print(f"Price:          {_fmt(snapshot.price)}")
     print(f"24h:            {_fmt(snapshot.price_change_24h, '%')}")
     print(f"Volume:         {_fmt(snapshot.volume_24h)}")
@@ -152,7 +159,9 @@ def print_btc_market_state(state):
 
     print()
     print("Signals:")
-    if state.signals:
+    if market_status == "INSUFFICIENT":
+        print("INSUFFICIENT DATA")
+    elif state.signals:
         for signal in state.signals:
             print(
                 f"- {signal.name} "
@@ -339,6 +348,103 @@ def print_btc_market_state(state):
     print()
     print(f"Confluence:     {state.confluence}")
     print(f"Market regime:  {state.market_regime}")
+    print("========================================\n")
+
+    print_btc_intraday_state(getattr(state, "intraday", None))
+
+
+def print_btc_intraday_state(intraday):
+    print("\n========================================")
+    print("BTC INTRADAY STATE")
+    print("========================================")
+
+    if intraday is None:
+        print("Status: INSUFFICIENT")
+        print("Decision: INSUFFICIENT_DATA")
+        print("========================================\n")
+        return
+
+    snapshot = intraday.snapshot
+    liquidity = snapshot.liquidity
+
+    status = getattr(intraday, "status", getattr(snapshot, "status", "UNKNOWN"))
+    available = getattr(intraday, "data_available", None) or getattr(snapshot, "data_available", {}) or {}
+    print(f"Status: {status}")
+    print("Data available:")
+    for key in ["price", "klines", "volume", "open_interest", "funding", "order_book"]:
+        print(f"{key}={'yes' if available.get(key) else 'no'}")
+    if snapshot.errors:
+        print(f"Errors: {_list_text(snapshot.errors)}")
+    print()
+    print("PRICE")
+    print(f"5m:   {_fmt(snapshot.price_change_5m, '%')}")
+    print(f"15m:  {_fmt(snapshot.price_change_15m, '%')}")
+    print(f"30m:  {_fmt(snapshot.price_change_30m, '%')}")
+    print(f"1h:   {_fmt(snapshot.price_change_1h, '%')}")
+    print(f"4h:   {_fmt(snapshot.price_change_4h, '%')}")
+    print(f"24h:  {_fmt(snapshot.price_change_24h, '%')}")
+    print()
+    print("VOLUME")
+    print(f"15m:   {_fmt(snapshot.volume_15m)} ratio={_fmt(snapshot.volume_ratio_15m)}")
+    print(f"1h:    {_fmt(snapshot.volume_1h)} ratio={_fmt(snapshot.volume_ratio_1h)}")
+    print(f"4h:    {_fmt(snapshot.volume_4h)} ratio={_fmt(snapshot.volume_ratio_4h)}")
+    print()
+    print("VOLATILITY")
+    print(f"15m: {_fmt(snapshot.realized_volatility_15m, '%')} ratio={_fmt(snapshot.volatility_ratio_15m)}")
+    print(f"1h:  {_fmt(snapshot.realized_volatility_1h, '%')} ratio={_fmt(snapshot.volatility_ratio_1h)}")
+    print(f"4h:  {_fmt(snapshot.realized_volatility_4h, '%')} ratio={_fmt(snapshot.volatility_ratio_4h)}")
+    print()
+    print("DERIVATIVES")
+    print(f"OI 15m: {_fmt(snapshot.oi_change_15m, '%')}")
+    print(f"OI 1h:  {_fmt(snapshot.oi_change_1h, '%')}")
+    print(f"OI 4h:  {_fmt(snapshot.oi_change_4h, '%')}")
+    print(f"Funding: {_fmt(snapshot.funding_rate)}")
+    print(f"Funding regime: {snapshot.funding_regime}")
+    print()
+    print("STRUCTURE")
+    print(f"15m: {snapshot.structure_15m}")
+    print(f"1h:  {snapshot.structure_1h}")
+    print(f"4h:  {snapshot.structure_4h}")
+    print(f"1d:  {snapshot.structure_1d}")
+    print()
+    print("LIQUIDITY")
+    print(f"Visible above: {_fmt(liquidity.nearest_visible_above)} ({liquidity.visible_above})")
+    print(f"Visible below: {_fmt(liquidity.nearest_visible_below)} ({liquidity.visible_below})")
+    print(f"Inferred above: {_fmt(liquidity.equal_highs)} ({liquidity.inferred_above})")
+    print(f"Inferred below: {_fmt(liquidity.equal_lows)} ({liquidity.inferred_below})")
+    print(f"Previous day high: {_fmt(liquidity.previous_day_high)}")
+    print(f"Previous day low:  {_fmt(liquidity.previous_day_low)}")
+    print(f"Previous week high: {_fmt(liquidity.previous_week_high)}")
+    print(f"Previous week low:  {_fmt(liquidity.previous_week_low)}")
+    print(f"Liquidity imbalance: {liquidity.liquidity_imbalance}")
+    print()
+    print("SMC / PRICE ACTION")
+    if intraday.signals:
+        for signal in intraday.signals:
+            print(
+                f"- {signal.name} timeframe={signal.timeframe} "
+                f"strength={signal.strength} certainty={signal.certainty} "
+                f"source={signal.source} evidence={signal.evidence}"
+            )
+    else:
+        print("None")
+    print()
+    print("CATALYST")
+    print(f"Status: {intraday.catalyst_status}")
+    print(f"Source: {intraday.catalyst_source or 'None'}")
+    print(f"Confidence: {intraday.catalyst_confidence}")
+    print()
+    print("SCORING")
+    print(f"Move abnormality:       {intraday.move_abnormality_score}")
+    print(f"Liquidity importance:   {intraday.liquidity_importance_score}")
+    print(f"SMC confluence:         {intraday.smc_confluence_score}")
+    print(f"Intraday news relevance:{intraday.intraday_news_relevance}")
+    print(f"Intraday confluence:    {intraday.intraday_confluence_score}")
+    print(f"Materiality:            {intraday.intraday_materiality}")
+    print(f"Decision:               {intraday.decision}")
+    print(f"Time horizon:           {intraday.time_horizon}")
+    if snapshot.errors:
+        print(f"Errors:                 {_list_text(snapshot.errors)}")
     print("========================================\n")
 
 
