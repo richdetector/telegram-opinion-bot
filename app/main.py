@@ -7,6 +7,7 @@ from telegram_reader import get_telegram_news
 from filter import clean_news
 from classifier import classify_news
 from market_scorer import (
+    accepted_by_paths,
     can_reach_selection,
     pre_candidate_acceptance_reason,
     score_market_news,
@@ -23,6 +24,7 @@ from config import (
     ARTICLE_TIMEOUT_SECONDS,
     AUTO_PUBLISH_SHADOW,
     DRY_RUN,
+    DAILY_RECAP_ENABLED,
     MARKET_DATA_TIMEOUT_SECONDS,
     MARKET_DATA_PHASE_TIMEOUT_SECONDS,
     OPENAI_TIMEOUT_SECONDS,
@@ -30,7 +32,10 @@ from config import (
     QUIET_MARKET_ENABLED,
     TELEGRAM_TIMEOUT_SECONDS,
 )
+from combined_story import attach_market_reaction_to_news
 from crypto_market_engine import fetch_btc_market_state, market_state_to_news_item
+from daily_publication_gate import apply_daily_publication_gate
+from daily_recap import evaluate_daily_market_recap
 from diagnostics import (
     count_market_discards,
     count_pre_candidate_rejections,
@@ -43,9 +48,17 @@ from dry_run_report import (
     print_final_decision_gate,
     print_funnel_summary,
 )
+from editorial_lanes import (
+    direct_lane_item,
+    lane_for_item,
+    sort_for_publication,
+    split_selector_lanes,
+)
+from editorial_image import build_image_brief
 from formatter import format_report
 from intraday_engine import attach_intraday_catalyst
 from intraday_publication_gate import apply_intraday_publication_gate
+from market_interpreter import attach_editorial_interpretations
 from publication_gate import apply_publication_gate
 from publishing import publish_selected
 from quiet_market import evaluate_quiet_market, quiet_market_fingerprint
@@ -65,7 +78,7 @@ from pending import is_pending
 
 
 PRE_CANDIDATES = 30
-MAX_PUBLICATIONS = 2
+MAX_PUBLICATIONS = 6
 RSS_LIMIT_PER_FEED = 10
 TELEGRAM_LIMIT_PER_CHANNEL = 3
 
@@ -78,18 +91,51 @@ def _preselect_market_candidates(news):
         if can_reach_selection(item)
     ]
 
-    candidates.sort(
-        key=lambda item: (
-            item.materiality == "CRITICAL",
-            item.market_impact,
-            item.confluence_score,
-            item.source_reliability,
-            item.source_speed,
-        ),
-        reverse=True,
-    )
+    candidates = sort_for_publication(candidates)
 
     return candidates[:PRE_CANDIDATES]
+
+
+def _dedupe_extend(base, additions):
+    links = {item.link for item in base}
+    for item in additions:
+        if item.link not in links:
+            base.append(item)
+            links.add(item.link)
+    return base
+
+
+def _is_intraday_lane_item(item):
+    return (
+        lane_for_item(item) in {"INTRADAY_NOTE", "INTRADAY_ALERT"}
+    )
+
+
+def _intraday_flow(funnel):
+    return funnel.setdefault(
+        "intraday_pipeline",
+        {
+            "state_decision": "UNKNOWN",
+            "candidate_created": "no",
+            "market_interpreter": "NOT_RUN",
+            "writer": "NOT_RUN",
+            "reviewer": "NOT_RUN",
+            "note_gate": "NOT_RUN",
+            "alert_gate": "NOT_RUN",
+            "dedupe": "NOT_RUN",
+            "frequency": "NOT_RUN",
+            "publisher": "NOT_RUN",
+            "final_result": "NO_INTRADAY_CANDIDATE",
+            "rejection_reason": "NO_INTRADAY_CANDIDATE",
+        },
+    )
+
+
+def _prepare_image_diagnostics(items):
+    for item in items:
+        brief = build_image_brief(item)
+        item.image_eligible = brief.eligible
+        item.image_brief = brief.brief
 
 
 def _print_pre_candidates(news):
@@ -113,7 +159,15 @@ def _print_pre_candidates(news):
         print(f"source_type: {item.source_type}")
         print(f"event_type: {item.event_type}")
         print(f"affected_assets: {','.join(item.affected_assets)}")
+        print(f"structural_relevance: {item.structural_news_relevance}")
+        print(f"daily_relevance: {item.daily_news_relevance}")
+        print(f"intraday_relevance: {item.intraday_news_relevance}")
+        print(f"rumor_relevance: {item.rumor_relevance}")
+        print(f"accepted_by: {','.join(accepted_by_paths(item))}")
         print(f"reason_accepted: {pre_candidate_acceptance_reason(item)}")
+        print(f"image_eligible: {item.image_eligible}")
+        if item.image_brief:
+            print(f"image_brief: {item.image_brief}")
         print("----------------------------------------")
 
     print("====================\n")
@@ -234,6 +288,12 @@ async def process_news():
     if btc_market_state is not None and getattr(btc_market_state, "intraday", None) is not None:
         attach_intraday_catalyst(btc_market_state.intraday, fast_context_news)
 
+    daily_recap_decision = (
+        evaluate_daily_market_recap(btc_market_state, seen_cache=seen_cache)
+        if DAILY_RECAP_ENABLED and market_state_enabled
+        else None
+    )
+
     market_state_news = (
         [market_state_to_news_item(btc_market_state)]
         if market_state_enabled and btc_market_state is not None
@@ -244,11 +304,26 @@ async def process_news():
         for item in market_state_news
         if item is not None
     ]
+    if daily_recap_decision and daily_recap_decision.note is not None:
+        market_state_news.append(daily_recap_decision.note)
+    intraday_flow = _intraday_flow(funnel)
+    intraday_state = getattr(btc_market_state, "intraday", None) if btc_market_state is not None else None
+    intraday_flow["state_decision"] = getattr(intraday_state, "decision", "UNKNOWN")
+    intraday_flow["candidate_created"] = "yes" if any(_is_intraday_lane_item(item) for item in market_state_news) else "no"
+    if intraday_flow["candidate_created"] == "yes":
+        intraday_flow["final_result"] = "CANDIDATE_CREATED"
+        intraday_flow["rejection_reason"] = ""
+    funnel["daily_recap"] = daily_recap_decision
 
     noticias = list(fast_context_news)
     noticias.extend(market_state_news)
     collected_total = len(noticias)
     noticias, intake_stats = seen_cache.filter_new_items(noticias)
+    if intraday_flow["candidate_created"] == "yes":
+        intraday_flow["dedupe"] = "PASS" if any(_is_intraday_lane_item(item) for item in noticias) else "FAIL"
+        if intraday_flow["dedupe"] == "FAIL":
+            intraday_flow["final_result"] = "REJECTED"
+            intraday_flow["rejection_reason"] = "duplicate_or_seen_cache"
 
     acquisition_time = time.perf_counter() - acquisition_start
 
@@ -286,6 +361,8 @@ async def process_news():
     log_checkpoint("[phase] CLASSIFIER START")
     noticias = classify_news(noticias)
     noticias = score_market_news(noticias)
+    if btc_market_state is not None and getattr(btc_market_state, "intraday", None) is not None:
+        noticias = attach_market_reaction_to_news(noticias, btc_market_state.intraday)
     classifier_time = time.perf_counter() - classifier_start
     log_checkpoint(f"[phase] CLASSIFIER DONE duration={classifier_time:.2f}s")
     funnel["after_market_scorer"] = len(noticias)
@@ -296,10 +373,16 @@ async def process_news():
             seen_cache.update_item_status(item, "DISCARDED")
 
     noticias = _preselect_market_candidates(noticias)
+    _prepare_image_diagnostics(noticias)
     total_precandidates = len(noticias)
     funnel["precandidates"] = total_precandidates
     seen_cache.mark_precandidates(noticias)
     _print_pre_candidates(noticias)
+    if intraday_flow["candidate_created"] == "yes" and any(_is_intraday_lane_item(item) for item in noticias):
+        intraday_flow["final_result"] = "PRECANDIDATE"
+    elif intraday_flow["candidate_created"] == "yes" and intraday_flow.get("dedupe") != "FAIL":
+        intraday_flow["final_result"] = "REJECTED"
+        intraday_flow["rejection_reason"] = "pre_candidate_filter"
 
     if not noticias:
         funnel["after_enrichment"] = 0
@@ -326,7 +409,10 @@ async def process_news():
         timeout_counter="article_timeout",
     )
     noticias = score_market_news(noticias)
+    if btc_market_state is not None and getattr(btc_market_state, "intraday", None) is not None:
+        noticias = attach_market_reaction_to_news(noticias, btc_market_state.intraday)
     noticias = _revalidate_precandidates_after_download(noticias)
+    _prepare_image_diagnostics(noticias)
     download_time = time.perf_counter() - download_start
 
     if not noticias:
@@ -355,23 +441,23 @@ async def process_news():
     )
     funnel["after_enrichment"] = len(noticias)
     noticias = score_market_news(noticias)
+    if btc_market_state is not None and getattr(btc_market_state, "intraday", None) is not None:
+        noticias = attach_market_reaction_to_news(noticias, btc_market_state.intraday)
+    _prepare_image_diagnostics(noticias)
     noticias = verify_news(noticias)
     funnel["after_verification"] = len(noticias)
     before_dedupe = len(noticias)
     noticias = dedupe_news(noticias)
     discard_counters["duplicate"] += max(0, before_dedupe - len(noticias))
     funnel["after_deduper"] = len(noticias)
+    if intraday_flow["candidate_created"] == "yes":
+        intraday_flow["dedupe"] = "PASS" if any(_is_intraday_lane_item(item) for item in noticias) else "FAIL"
+        if intraday_flow["dedupe"] == "FAIL":
+            intraday_flow["final_result"] = "REJECTED"
+            intraday_flow["rejection_reason"] = "deduper"
     enricher_time = time.perf_counter() - enricher_start
 
-    noticias.sort(
-        key=lambda n: (
-            n.materiality == "CRITICAL",
-            n.market_impact,
-            n.confluence_score,
-            n.source_reliability,
-        ),
-        reverse=True,
-    )
+    noticias = sort_for_publication(noticias)
 
     print("\n==================== MARKET IMPACT ====================")
 
@@ -389,14 +475,19 @@ async def process_news():
 
     selector_start = time.perf_counter()
     selector_input = list(noticias)
-    noticias = await run_sync_phase(
+    structural_lane, direct_lanes = split_selector_lanes(noticias)
+    selected_by_ai = await run_sync_phase(
         "SELECTOR",
-        lambda: select_news_with_ai(noticias),
+        lambda: select_news_with_ai(structural_lane),
         timeout=OPENAI_TIMEOUT_SECONDS,
         fallback=[],
         counters=network_counters,
         timeout_counter="openai_timeout",
     )
+    noticias = []
+    _dedupe_extend(noticias, direct_lanes)
+    _dedupe_extend(noticias, selected_by_ai)
+    noticias = sort_for_publication(noticias)
     noticias = noticias[:MAX_PUBLICATIONS]
     selector_time = time.perf_counter() - selector_start
     funnel["selected"] = len(noticias)
@@ -406,8 +497,9 @@ async def process_news():
         noticias,
     )
 
+    structural_gate_items = [item for item in noticias if not direct_lane_item(item)]
     normal_pre, pre_gate_results, pre_gate_counters = apply_publication_gate(
-        noticias,
+        structural_gate_items,
         {"ok": True, "errors": []},
     )
     rumor_pre, rumor_pre_results = apply_rumor_gate(
@@ -418,18 +510,29 @@ async def process_news():
         noticias,
         {"ok": True, "errors": []},
     )
-    normal_links = {item.link for item in normal_pre}
-    noticias = normal_pre + [
-        item
-        for item in rumor_pre
-        if item.link not in normal_links
-    ]
-    pre_links = {item.link for item in noticias}
-    noticias.extend(
-        item
-        for item in intraday_pre
-        if item.link not in pre_links
+    intraday_results = [result for result in intraday_pre_results]
+    if intraday_results:
+        decision = (intraday_results[0].item.intelligence_summary or {}).get("INTRADAY_DECISION")
+        if decision == "INTRADAY_NOTE":
+            intraday_flow["note_gate"] = "PASS" if intraday_pre else "FAIL"
+            intraday_flow["alert_gate"] = "NOT_REQUIRED"
+        elif decision == "INTRADAY_ALERT":
+            intraday_flow["alert_gate"] = "PASS" if intraday_pre else "FAIL"
+            intraday_flow["note_gate"] = "NOT_REQUIRED"
+        intraday_flow["frequency"] = "PASS" if intraday_pre else "FAIL"
+        intraday_flow["final_result"] = "PRE_GATE_PASS" if intraday_pre else "REJECTED"
+        intraday_flow["rejection_reason"] = (
+            "PASS" if intraday_pre else ",".join(intraday_results[0].reasons)
+        )
+    daily_pre, daily_pre_results, daily_pre_counters = apply_daily_publication_gate(
+        noticias,
+        {"ok": True, "errors": []},
     )
+    noticias = []
+    for lane in [normal_pre, intraday_pre, daily_pre, rumor_pre]:
+        _dedupe_extend(noticias, lane)
+    noticias = sort_for_publication(noticias)
+    noticias = noticias[:MAX_PUBLICATIONS]
     normal_pass_links = {result.item.link for result in pre_gate_results if result.passed}
     pre_gate_results = pre_gate_results + [
         result
@@ -437,8 +540,10 @@ async def process_news():
         if result.passed and result.item.link not in normal_pass_links
     ]
     pre_gate_results.extend(intraday_pre_results)
+    pre_gate_results.extend(daily_pre_results)
     discard_counters.update(pre_gate_counters)
     discard_counters.update(intraday_pre_counters)
+    discard_counters.update(daily_pre_counters)
 
     if not noticias:
         funnel["reviewer_pass"] = False
@@ -452,6 +557,9 @@ async def process_news():
         log_checkpoint("[cycle] DONE process_news")
         return
 
+    attach_editorial_interpretations(noticias)
+    if any(_is_intraday_lane_item(item) for item in noticias):
+        intraday_flow["market_interpreter"] = "PASS"
     writer_start = time.perf_counter()
     informe = await run_sync_phase(
         "WRITER",
@@ -473,6 +581,8 @@ async def process_news():
         print_dry_run_report([], [], dry_run=DRY_RUN, shadow=AUTO_PUBLISH_SHADOW)
         log_checkpoint("[cycle] DONE process_news")
         return
+    if any(item.event_type == "BTC_INTRADAY_MOVE" for item in noticias):
+        intraday_flow["writer"] = "PASS"
 
     reviewer_start = time.perf_counter()
     revision = await run_sync_phase(
@@ -486,9 +596,12 @@ async def process_news():
     reviewer_time = time.perf_counter() - reviewer_start
     reviewer_pass = bool(revision.get("ok"))
     funnel["reviewer_pass"] = reviewer_pass
+    if any(item.event_type == "BTC_INTRADAY_MOVE" for item in noticias):
+        intraday_flow["reviewer"] = "PASS" if reviewer_pass else "FAIL"
 
+    structural_gate_items = [item for item in noticias if not direct_lane_item(item)]
     normal_publishable, final_gate_results, final_gate_counters = apply_publication_gate(
-        noticias,
+        structural_gate_items,
         revision,
     )
     rumor_publishable, rumor_final_results = apply_rumor_gate(
@@ -499,18 +612,28 @@ async def process_news():
         noticias,
         revision,
     )
-    normal_links = {item.link for item in normal_publishable}
-    publishable = normal_publishable + [
-        item
-        for item in rumor_publishable
-        if item.link not in normal_links
-    ]
-    publishable_links = {item.link for item in publishable}
-    publishable.extend(
-        item
-        for item in intraday_publishable
-        if item.link not in publishable_links
+    if intraday_final_results:
+        decision = (intraday_final_results[0].item.intelligence_summary or {}).get("INTRADAY_DECISION")
+        if decision == "INTRADAY_NOTE":
+            intraday_flow["note_gate"] = "PASS" if intraday_publishable else "FAIL"
+            intraday_flow["alert_gate"] = "NOT_REQUIRED"
+        elif decision == "INTRADAY_ALERT":
+            intraday_flow["alert_gate"] = "PASS" if intraday_publishable else "FAIL"
+            intraday_flow["note_gate"] = "NOT_REQUIRED"
+        intraday_flow["frequency"] = "PASS" if intraday_publishable else "FAIL"
+        intraday_flow["final_result"] = "GATE_PASS" if intraday_publishable else "REJECTED"
+        intraday_flow["rejection_reason"] = (
+            "PASS" if intraday_publishable else ",".join(intraday_final_results[0].reasons)
+        )
+    daily_publishable, daily_final_results, daily_final_counters = apply_daily_publication_gate(
+        noticias,
+        revision,
     )
+    publishable = []
+    for lane in [normal_publishable, intraday_publishable, daily_publishable, rumor_publishable]:
+        _dedupe_extend(publishable, lane)
+    publishable = sort_for_publication(publishable)
+    publishable = publishable[:MAX_PUBLICATIONS]
     normal_pass_links = {result.item.link for result in final_gate_results if result.passed}
     final_gate_results = final_gate_results + [
         result
@@ -518,8 +641,10 @@ async def process_news():
         if result.passed and result.item.link not in normal_pass_links
     ]
     final_gate_results.extend(intraday_final_results)
+    final_gate_results.extend(daily_final_results)
     discard_counters.update(final_gate_counters)
     discard_counters.update(intraday_final_counters)
+    discard_counters.update(daily_final_counters)
 
     if not publishable:
         funnel["would_publish"] = 0
@@ -540,6 +665,10 @@ async def process_news():
         return
 
     noticias = publishable
+    if any(item.event_type == "BTC_INTRADAY_MOVE" for item in noticias):
+        intraday_flow["publisher"] = "DRY_RUN" if DRY_RUN else "SHADOW_AUTO" if AUTO_PUBLISH_SHADOW else "LIVE"
+        intraday_flow["final_result"] = "WOULD_PUBLISH" if (DRY_RUN or AUTO_PUBLISH_SHADOW) else "PUBLISHED"
+        intraday_flow["rejection_reason"] = "PASS"
     mensajes = format_report(informe)
     mensajes = mensajes[:len(noticias)]
     funnel["would_publish"] = len(mensajes)
@@ -566,6 +695,8 @@ async def process_news():
         timeout_counter="telegram_timeout",
     )
     seen_cache.mark_published(noticias)
+    if any(item.event_type == "BTC_DAILY_RECAP" for item in noticias) and daily_recap_decision:
+        seen_cache.remember_daily_recap(daily_recap_decision.fingerprint, published=True)
 
     total_time = time.perf_counter() - start
 

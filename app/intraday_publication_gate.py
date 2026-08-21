@@ -2,7 +2,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from config import INTRADAY_MAX_DATA_AGE_MINUTES, INTRADAY_MAX_PER_4H, INTRADAY_MIN_CONFLUENCE
+from config import (
+    INTRADAY_ALERT_MIN_CONFLUENCE,
+    INTRADAY_MAX_DATA_AGE_MINUTES,
+    INTRADAY_MAX_PER_4H,
+    INTRADAY_NOTE_MIN_CONFLUENCE,
+)
 from history import recent_history
 
 
@@ -11,6 +16,7 @@ INTRADAY_REJECT_REASONS = [
     "reviewer_failed",
     "low_intraday_confluence",
     "low_intraday_materiality",
+    "weak_intraday_note",
     "stale_market_data",
     "insufficient_independent_signals",
     "duplicate",
@@ -96,10 +102,17 @@ def evaluate_intraday_item(item, review_ok=True, duplicate_keys=None):
     if not review_ok:
         reasons.append("reviewer_failed")
 
-    if item.confluence_score < INTRADAY_MIN_CONFLUENCE:
+    decision = item.intelligence_summary.get("INTRADAY_DECISION") if item.intelligence_summary else ""
+    is_note = decision == "INTRADAY_NOTE" or item.category == "BTC Intraday Note"
+    min_confluence = INTRADAY_NOTE_MIN_CONFLUENCE if is_note else INTRADAY_ALERT_MIN_CONFLUENCE
+
+    if item.confluence_score < min_confluence:
         reasons.append("low_intraday_confluence")
 
-    if item.materiality not in {"HIGH", "CRITICAL"}:
+    if is_note:
+        if item.materiality not in {"MEDIUM", "HIGH", "CRITICAL"}:
+            reasons.append("low_intraday_materiality")
+    elif item.materiality not in {"HIGH", "CRITICAL"}:
         reasons.append("low_intraday_materiality")
 
     age = item.intelligence_summary.get("MARKET_DATA_AGE_MINUTES") if item.intelligence_summary else None
@@ -108,6 +121,8 @@ def evaluate_intraday_item(item, review_ok=True, duplicate_keys=None):
 
     if _independent_signal_count(item) < 2 and item.confluence_score < 90:
         reasons.append("insufficient_independent_signals")
+    if is_note and _independent_signal_count(item) < 3 and item.confluence_score < INTRADAY_ALERT_MIN_CONFLUENCE:
+        reasons.append("weak_intraday_note")
 
     if item.link in duplicate_keys or item.duplicate:
         reasons.append("duplicate")

@@ -2,11 +2,14 @@ from pathlib import Path
 import json
 
 from ai import ask_json
+from market_interpreter import attach_editorial_interpretations
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "market_writer.md"
 
 
 def write_news(news):
+
+    attach_editorial_interpretations(news)
 
     rules = PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -38,6 +41,27 @@ Fecha:
 
 Market impact:
 {item.market_impact}
+
+Relevancia estructural:
+{item.structural_news_relevance}
+
+Relevancia diaria:
+{item.daily_news_relevance}
+
+Relevancia intradía:
+{item.intraday_news_relevance}
+
+Aceptado por:
+{", ".join(item.accepted_by)}
+
+Imagen elegible:
+{item.image_eligible}
+
+Brief de imagen:
+{item.image_brief}
+
+Interpretacion editorial interna:
+{json.dumps((item.intelligence_summary or {}).get("EDITORIAL_INTERPRETATION", {}), ensure_ascii=False, indent=2)}
 
 Materialidad:
 {item.materiality}
@@ -92,7 +116,9 @@ Contenido:
                 "reading": "",
                 "what_to_watch": "",
                 "status": "",
-                "confidence": ""
+                "confidence": "",
+                "telegram_text": "",
+                "internal_diagnostic": {}
             }
         )
 

@@ -39,6 +39,13 @@ async def run_sync_phase(
             f"[phase] {phase} TIMEOUT duration={elapsed:.2f}s timeout={timeout}s"
         )
         return fallback() if callable(fallback) else fallback
+    except Exception as exc:
+        elapsed = time.perf_counter() - start
+        log_checkpoint(
+            f"[phase] {phase} ERROR duration={elapsed:.2f}s "
+            f"error={exc.__class__.__name__}: {exc}"
+        )
+        return fallback() if callable(fallback) else fallback
 
 
 async def run_async_phase(
@@ -65,6 +72,13 @@ async def run_async_phase(
         increment_counter(counters, timeout_counter)
         log_checkpoint(
             f"[phase] {phase} TIMEOUT duration={elapsed:.2f}s timeout={timeout}s"
+        )
+        return fallback() if callable(fallback) else fallback
+    except Exception as exc:
+        elapsed = time.perf_counter() - start
+        log_checkpoint(
+            f"[phase] {phase} ERROR duration={elapsed:.2f}s "
+            f"error={exc.__class__.__name__}: {exc}"
         )
         return fallback() if callable(fallback) else fallback
 

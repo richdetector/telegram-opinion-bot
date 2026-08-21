@@ -99,6 +99,8 @@ def mechanism_strength(item):
         "CRYPTO_REGULATION",
         "CRYPTO_MARKET_STRUCTURE",
         "SYSTEMIC_COMPANY",
+        "BTC_DAILY_RECAP",
+        "COMBINED_MARKET_STORY",
     }
     strong_second_order_events = {
         "CENTRAL_BANK",
@@ -120,6 +122,16 @@ def mechanism_strength(item):
             "funding",
             "open interest",
             "liquidation",
+            "clarity act",
+            "crypto regulation",
+            "digital asset market clarity",
+            "stablecoin legislation",
+            "cftc crypto",
+            "sec crypto",
+            "white house crypto",
+            "24h price action",
+            "open interest",
+            "structure",
         ],
     )
     has_systemic_company = item.event_type == "SYSTEMIC_COMPANY" and _has_any(

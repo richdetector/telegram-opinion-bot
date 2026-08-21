@@ -1,3 +1,6 @@
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
 from market_taxonomy import (
     LOW_VALUE_CRYPTO,
     SMALL_PRICE_MOVE_PATTERNS,
@@ -16,6 +19,81 @@ MATERIALITY_RANK = {
     "HIGH": 2,
     "CRITICAL": 3,
 }
+
+INTRADAY_NEWS_PRE_CANDIDATE_THRESHOLD = 82
+DAILY_NEWS_PRE_CANDIDATE_THRESHOLD = 76
+RUMOR_PRE_CANDIDATE_THRESHOLD = 75
+
+SHORT_HORIZON_CRYPTO_POLICY_TERMS = [
+    "clarity act",
+    "digital asset market clarity",
+    "market structure bill",
+    "crypto market structure",
+    "crypto regulation",
+    "stablecoin legislation",
+    "stablecoin bill",
+    "genius act",
+    "sec crypto",
+    "cftc crypto",
+    "bitcoin reserve",
+    "strategic bitcoin reserve",
+    "white house crypto",
+    "treasury crypto",
+    "crypto czar",
+    "committee vote",
+    "house vote",
+    "senate vote",
+    "markup",
+    "court ruling",
+    "regulatory deadline",
+]
+
+SHORT_HORIZON_MARKET_TERMS = [
+    "etf headline",
+    "etf approval",
+    "etf delay",
+    "etf deadline",
+    "spot bitcoin etf",
+    "bitcoin etf",
+    "exchange outage",
+    "sec charges",
+    "sec sues",
+    "hack",
+    "exploit",
+    "depeg",
+    "custody",
+    "institutional custody",
+    "tariff",
+    "sanctions",
+    "oil",
+    "iran",
+    "strait of hormuz",
+]
+
+MARKET_SENSITIVE_ACTORS = [
+    "trump",
+    "donald trump",
+    "white house",
+    "treasury secretary",
+    "sec chair",
+    "cftc chair",
+    "fed chair",
+    "powell",
+    "lagarde",
+    "xi",
+    "china",
+]
+
+GENERIC_POLITICAL_CHATTER = [
+    "rally speech",
+    "campaign event",
+    "poll",
+    "election odds",
+    "criticized",
+    "attacked",
+    "mocked",
+    "interview",
+]
 
 ROUTINE_TERMS = [
     "consolidated banking data",
@@ -138,6 +216,236 @@ MATERIAL_GEOPOLITICAL_TERMS = [
 
 def _contains_any(text, words):
     return any(keyword_in_text(word, text) for word in words)
+
+
+def _parse_published(value):
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except Exception:
+        parsed = None
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _age_hours(item, now=None):
+    published = _parse_published(item.published)
+    if published is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, (now - published).total_seconds() / 3600)
+
+
+def _freshness_score(item, intraday=False, now=None):
+    age = _age_hours(item, now=now)
+    if age is None:
+        return 8 if not intraday else 4
+    if intraday:
+        if age <= 2:
+            return 22
+        if age <= 4:
+            return 16
+        if age <= 8:
+            return 8
+        return 0
+    if age <= 6:
+        return 18
+    if age <= 24:
+        return 12
+    if age <= 48:
+        return 4
+    return 0
+
+
+def _is_stale_for_short_horizon(item, intraday=False):
+    age = _age_hours(item)
+    if age is None:
+        return False
+    return age > (8 if intraday else 36)
+
+
+def _short_horizon_source_score(item):
+    if item.source_type == "PRIMARY":
+        return 16
+    if item.source_type == "HIGH_RELIABILITY":
+        return 14
+    if item.source_type == "FAST":
+        return 10
+    if item.source_type == "COMMUNITY":
+        return 2
+    return 6
+
+
+def _actor_importance_score(text):
+    if _contains_any(text, MARKET_SENSITIVE_ACTORS):
+        return 18
+    return 0
+
+
+def _policy_specificity_score(text):
+    score = 0
+    if _contains_any(text, SHORT_HORIZON_CRYPTO_POLICY_TERMS):
+        score += 24
+    if _contains_any(text, SHORT_HORIZON_MARKET_TERMS):
+        score += 14
+    if _contains_any(text, ["bitcoin", "btc"]):
+        score += 12
+    if _contains_any(text, ["ethereum", "eth", "ether"]):
+        score += 5
+    return min(score, 36)
+
+
+def _news_novelty_score(text):
+    if _contains_any(
+        text,
+        [
+            "passes",
+            "passed",
+            "advances",
+            "approved",
+            "rejects",
+            "blocked",
+            "delayed",
+            "vote",
+            "deadline",
+            "announces",
+            "threatens",
+            "urges congress",
+            "unexpected",
+            "breaking",
+        ],
+    ):
+        return 18
+    if _contains_any(text, ["could", "may", "reportedly", "rumor", "sources say"]):
+        return 10
+    return 0
+
+
+def _short_horizon_market_sensitivity(text, item):
+    score = 0
+    if item.event_type in {"CRYPTO_REGULATION", "FISCAL_TRADE", "GEOPOLITICAL_MARKET"}:
+        score += 14
+    if _contains_any(text, ["sec", "cftc", "white house", "treasury", "tariff", "sanctions"]):
+        score += 10
+    if _contains_any(text, ["risk assets", "yields", "usd", "oil", "nasdaq", "bitcoin", "btc"]):
+        score += 8
+    return min(score, 22)
+
+
+def _generic_chatter_penalty(text):
+    if _contains_any(text, GENERIC_POLITICAL_CHATTER) and not _contains_any(
+        text,
+        SHORT_HORIZON_CRYPTO_POLICY_TERMS + SHORT_HORIZON_MARKET_TERMS,
+    ):
+        return 30
+    return 0
+
+
+def _score_horizon_relevance(item, text, has_material_gate):
+    source = _short_horizon_source_score(item)
+    actor = _actor_importance_score(text)
+    policy = _policy_specificity_score(text)
+    novelty = _news_novelty_score(text)
+    sensitivity = _short_horizon_market_sensitivity(text, item)
+    confirmation = 10 if item.verification_status == "CONFIRMED" or item.is_confirmed else 4
+    penalty = _generic_chatter_penalty(text)
+
+    daily = (
+        _freshness_score(item, intraday=False)
+        + source
+        + actor
+        + policy
+        + novelty
+        + sensitivity
+        + confirmation
+        - penalty
+    )
+
+    intraday = (
+        _freshness_score(item, intraday=True)
+        + source
+        + actor
+        + policy
+        + novelty
+        + sensitivity
+        + (6 if item.source_type == "FAST" or item.source_speed >= 75 else 0)
+        - penalty
+    )
+
+    if has_material_gate:
+        daily += 6
+        intraday += 4
+
+    if _is_stale_for_short_horizon(item, intraday=False):
+        daily = min(daily, 45)
+    if _is_stale_for_short_horizon(item, intraday=True):
+        intraday = min(intraday, 45)
+
+    item.structural_news_relevance = item.market_impact
+    item.daily_news_relevance = max(0, min(100, int(daily)))
+    item.intraday_news_relevance = max(0, min(100, int(intraday)))
+    item.rumor_relevance = max(
+        0,
+        min(
+            100,
+            int(
+                item.rumor_score
+                or (
+                    item.market_impact * 0.55
+                    + item.daily_news_relevance * 0.25
+                    + item.intraday_news_relevance * 0.20
+                )
+            ),
+        ),
+    )
+
+
+def accepted_by_paths(item):
+    paths = []
+
+    is_rumor = (
+        item.is_rumor
+        or item.verification_status == "RUMOR"
+        or item.declaration_status in {"THREATENED", "PROPOSED", "ANNOUNCED"}
+    )
+
+    if item.source == "MARKET_STATE":
+        paths.append("MARKET_STATE")
+        if (
+            item.event_type == "BTC_INTRADAY_MOVE"
+            and (item.intelligence_summary or {}).get("INTRADAY_DECISION") in {"INTRADAY_NOTE", "INTRADAY_ALERT"}
+        ):
+            paths.append("INTRADAY")
+
+    if item.materiality in {"HIGH", "CRITICAL"}:
+        paths.append("STRUCTURAL")
+    elif item.materiality == "MEDIUM" and _structural_medium_exception(item):
+        paths.append("STRUCTURAL")
+
+    if item.daily_news_relevance >= DAILY_NEWS_PRE_CANDIDATE_THRESHOLD and not _is_stale_for_short_horizon(item):
+        paths.append("DAILY")
+
+    if (
+        item.intraday_news_relevance >= INTRADAY_NEWS_PRE_CANDIDATE_THRESHOLD
+        and not _is_stale_for_short_horizon(item, intraday=True)
+    ):
+        paths.append("INTRADAY")
+
+    if is_rumor and _rumor_can_be_precandidate(item):
+        paths.append("RUMOR")
+
+    deduped = []
+    for path in paths:
+        if path not in deduped:
+            deduped.append(path)
+    return deduped
 
 
 def _cap_for_routine_content(text):
@@ -336,6 +644,20 @@ def _filter_assets_for_transmission(text, item, raw_assets):
     ]
 
     has_btc_direct = _contains_any(text, ["bitcoin", "btc", "spot bitcoin etf", "bitcoin etf"])
+    has_btc_policy = item.event_type == "CRYPTO_REGULATION" and _contains_any(
+        text,
+        [
+            "clarity act",
+            "crypto regulation",
+            "digital asset market clarity",
+            "stablecoin legislation",
+            "sec crypto",
+            "cftc crypto",
+            "white house crypto",
+            "crypto market structure",
+            "bitcoin reserve",
+        ],
+    )
     has_eth_direct = _contains_any(text, ["ethereum", "ether", "spot eth etf", "eth etf"])
 
     strong_macro_btc = (
@@ -355,7 +677,7 @@ def _filter_assets_for_transmission(text, item, raw_assets):
         )
     )
 
-    if has_btc_direct or strong_macro_btc:
+    if has_btc_direct or has_btc_policy or strong_macro_btc:
         assets.append("BTC")
 
     if has_eth_direct and (
@@ -472,6 +794,8 @@ def score_market_item(item):
     item.event_type = detect_event_type(text)
     if _contains_any(text, ["bitcoin etf", "spot bitcoin etf", "etf inflows", "etf outflows"]):
         item.event_type = "CRYPTO_REGULATION"
+    elif _contains_any(text, SHORT_HORIZON_CRYPTO_POLICY_TERMS):
+        item.event_type = "CRYPTO_REGULATION"
     elif _contains_any(text, ["open interest", "funding", "liquidation", "liquidations"]):
         item.event_type = "CRYPTO_MARKET_STRUCTURE"
 
@@ -544,6 +868,7 @@ def score_market_item(item):
     item.market_impact = max(0, min(100, int(score)))
     item.score = item.market_impact
     item.materiality = _infer_materiality(item.market_impact, has_material_gate)
+    _score_horizon_relevance(item, text, has_material_gate)
     item.impact_horizon = "INTRADAY" if item.source_speed >= 80 and has_material_gate else "DAYS_WEEKS"
     item.geographic_scope = "GLOBAL" if item.asset_class in {"MACRO", "CRYPTO", "RATES", "FX"} else "REGIONAL"
     item.confluence_score = min(100, len(set(item.market_signals)) * 15)
@@ -557,6 +882,9 @@ def score_market_item(item):
 
     item.mechanism = _mechanism_for(item)
     item.intelligence_summary = build_intelligence_summary(item)
+    item.accepted_by = accepted_by_paths(item)
+    if "DAILY" in item.accepted_by and "BTC" in item.affected_assets and item.category == "General":
+        item.category = "BTC Hoy"
 
     return item
 
@@ -600,20 +928,83 @@ def score_market_news(news):
     return [score_market_item(item) for item in news]
 
 
-def pre_candidate_acceptance_reason(item):
-    if not can_reach_selection(item):
-        return ""
-
-    is_rumor = (
+def _is_rumor_like(item):
+    return (
         item.is_rumor
         or item.verification_status == "RUMOR"
         or item.declaration_status in {"THREATENED", "PROPOSED", "ANNOUNCED"}
     )
 
+
+def _structural_medium_exception(item):
+    return (
+        item.source_reliability >= 80
+        and item.event_type in {"CENTRAL_BANK", "MACRO_DATA", "CRYPTO_REGULATION", "LIQUIDITY"}
+        and item.market_impact >= 55
+        and item.mechanism != "no clear material market transmission"
+    )
+
+
+def _rumor_source_relevant(item):
+    return (
+        item.source_reliability >= 55
+        or item.source_type in {"PRIMARY", "HIGH_RELIABILITY"}
+        or item.source == "Truth Social @realDonaldTrump"
+    )
+
+
+def _rumor_can_be_precandidate(item):
+    rumor_strength = max(item.rumor_relevance, item.market_impact)
+    return (
+        rumor_strength >= RUMOR_PRE_CANDIDATE_THRESHOLD
+        and item.market_impact >= 55
+        and item.materiality in {"MEDIUM", "HIGH", "CRITICAL"}
+        and _rumor_source_relevant(item)
+        and item.mechanism != "no clear material market transmission"
+    )
+
+
+def _short_horizon_can_be_precandidate(item):
+    if item.mechanism == "no clear material market transmission":
+        return False
+    if not item.affected_assets:
+        return False
+    daily_ok = (
+        item.daily_news_relevance >= DAILY_NEWS_PRE_CANDIDATE_THRESHOLD
+        and not _is_stale_for_short_horizon(item)
+    )
+    intraday_ok = (
+        item.intraday_news_relevance >= INTRADAY_NEWS_PRE_CANDIDATE_THRESHOLD
+        and not _is_stale_for_short_horizon(item, intraday=True)
+    )
+    return daily_ok or intraday_ok
+
+
+def pre_candidate_acceptance_reason(item):
+    paths = accepted_by_paths(item)
+    if not paths:
+        return ""
+
+    if (
+        item.source == "MARKET_STATE"
+        and item.event_type == "BTC_INTRADAY_MOVE"
+        and (item.intelligence_summary or {}).get("INTRADAY_DECISION") == "INTRADAY_NOTE"
+    ):
+        return "INTRADAY_NOTE"
+    if (
+        item.source == "MARKET_STATE"
+        and item.event_type == "BTC_INTRADAY_MOVE"
+        and (item.intelligence_summary or {}).get("INTRADAY_DECISION") == "INTRADAY_ALERT"
+    ):
+        return "INTRADAY_ALERT"
     if item.source == "MARKET_STATE":
         return "MARKET_STATE_ANOMALY"
-    if is_rumor:
+    if "RUMOR" in paths:
         return "MATERIAL_RUMOR"
+    if "INTRADAY" in paths:
+        return "INTRADAY_NEWS_PRE_CANDIDATE"
+    if "DAILY" in paths:
+        return "DAILY_NEWS_PRE_CANDIDATE"
     if item.materiality == "CRITICAL":
         return "CRITICAL_EVENT"
     if item.materiality == "HIGH":
@@ -625,37 +1016,31 @@ def pre_candidate_acceptance_reason(item):
 
 
 def can_reach_selection(item):
-    if item.materiality == "LOW":
-        return False
+    if (
+        item.source == "MARKET_STATE"
+        and item.event_type == "BTC_INTRADAY_MOVE"
+        and (item.intelligence_summary or {}).get("INTRADAY_DECISION") in {"INTRADAY_NOTE", "INTRADAY_ALERT"}
+        and item.materiality in {"MEDIUM", "HIGH", "CRITICAL"}
+        and item.confluence_score >= 58
+        and item.affected_assets
+    ):
+        return True
 
-    is_rumor = (
-        item.is_rumor
-        or item.verification_status == "RUMOR"
-        or item.declaration_status in {"THREATENED", "PROPOSED", "ANNOUNCED"}
-    )
-
-    if is_rumor:
-        source_relevant = (
-            item.source_reliability >= 55
-            or item.source_type in {"PRIMARY", "HIGH_RELIABILITY"}
-            or item.source == "Truth Social @realDonaldTrump"
-        )
-        return (
-            item.market_impact >= 75
-            and item.materiality in {"HIGH", "CRITICAL"}
-            and source_relevant
-            and item.mechanism != "no clear material market transmission"
+    if _is_rumor_like(item):
+        return _rumor_can_be_precandidate(item) or (
+            item.source_type == "FAST"
+            and item.source_speed >= 80
+            and _short_horizon_can_be_precandidate(item)
         )
 
     if item.materiality in {"HIGH", "CRITICAL"}:
         return True
 
     if item.materiality == "MEDIUM":
-        return (
-            item.source_reliability >= 80
-            and item.event_type in {"CENTRAL_BANK", "MACRO_DATA", "CRYPTO_REGULATION", "LIQUIDITY"}
-            and item.market_impact >= 55
-            and item.mechanism != "no clear material market transmission"
-        )
+        if _structural_medium_exception(item):
+            return True
+
+    if _short_horizon_can_be_precandidate(item):
+        return True
 
     return False

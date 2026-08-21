@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 
+from config import EDITOR_MAX_SELECTED
 from ai import ask_json
 from history import recent_history
 from market_scorer import can_reach_selection
@@ -9,21 +10,43 @@ from verification import passes_publish_safety
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "market_selector.md"
 
 MIN_MARKET_IMPACT = 65
-MAX_SELECTED = 2
+MAX_SELECTED = EDITOR_MAX_SELECTED
+
+
+def _lane_score(item):
+    return max(
+        item.market_impact,
+        getattr(item, "daily_news_relevance", 0),
+        getattr(item, "intraday_news_relevance", 0),
+        getattr(item, "rumor_relevance", 0),
+    )
+
+
+def _selector_eligible(item):
+    if not can_reach_selection(item):
+        return False
+    if passes_publish_safety(item):
+        return True
+    if item.event_type == "BTC_INTRADAY_MOVE" and item.confluence_score >= 58:
+        return True
+    if getattr(item, "daily_news_relevance", 0) >= 76:
+        return True
+    if getattr(item, "intraday_news_relevance", 0) >= 82:
+        return True
+    return False
 
 
 def _fallback_select(news):
     candidates = [
         item
         for item in news
-        if can_reach_selection(item)
-        and passes_publish_safety(item)
+        if _selector_eligible(item)
     ]
 
     candidates.sort(
         key=lambda item: (
             item.materiality == "CRITICAL",
-            item.market_impact,
+            _lane_score(item),
             item.source_reliability,
             item.confluence_score,
         ),
@@ -38,8 +61,8 @@ def select_news_with_ai(news, use_ai=True):
     news = [
         n
         for n in news
-        if n.market_impact >= MIN_MARKET_IMPACT
-        and can_reach_selection(n)
+        if _lane_score(n) >= MIN_MARKET_IMPACT
+        and _selector_eligible(n)
     ]
 
     if len(news) == 0:
@@ -74,6 +97,15 @@ Resumen:
 
 Market impact score:
 {item.market_impact}
+
+Relevancia diaria:
+{item.daily_news_relevance}
+
+Relevancia intradía:
+{item.intraday_news_relevance}
+
+Aceptado por:
+{", ".join(item.accepted_by)}
 
 Materialidad:
 {item.materiality}
@@ -130,13 +162,13 @@ Solo selecciona acontecimientos realmente excepcionales para mercados.
 
 No estás obligado a devolver ninguna noticia.
 
-Puedes devolver 0, 1 o 2.
+Puedes devolver 0, 1, 2 o más si hay varios eventos realmente distintos y materiales.
 
 Si ninguna merece la pena, devuelve una lista vacía.
 
 Evita repetir temas ya tratados recientemente salvo que exista un cambio realmente importante.
 
-Nunca selecciones más de dos.
+Nunca selecciones más de {MAX_SELECTED}.
 """
 
     data = ask_json(prompt)
@@ -150,7 +182,7 @@ Nunca selecciones más de dos.
 
         if 1 <= news_id <= len(news):
             item = news[news_id - 1]
-            if passes_publish_safety(item):
+            if _selector_eligible(item):
                 selected_news.append(item)
 
     return selected_news[:MAX_SELECTED]

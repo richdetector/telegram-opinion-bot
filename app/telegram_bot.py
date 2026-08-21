@@ -23,6 +23,17 @@ async def publish_message(text):
     )
 
 
+async def publish_photo(image_path, caption=""):
+
+    with open(image_path, "rb") as image:
+        return await bot.send_photo(
+            chat_id=CHANNEL_CHAT_ID,
+            photo=image,
+            caption=caption or None,
+            parse_mode="Markdown",
+        )
+
+
 async def send_review(
     text,
     pending_id,

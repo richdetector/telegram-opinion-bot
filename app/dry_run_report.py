@@ -44,6 +44,58 @@ def print_funnel_summary(funnel, discard_counters):
     print(f"Reviewer PASS:               {funnel.get('reviewer_pass', False)}")
     print(f"Habrían sido publicadas:     {funnel.get('would_publish', 0)}")
     print()
+    intraday_pipeline = funnel.get("intraday_pipeline")
+    if intraday_pipeline:
+        print("INTRADAY PUBLICATION FLOW")
+        for key in [
+            "state_decision",
+            "candidate_created",
+            "market_interpreter",
+            "writer",
+            "reviewer",
+            "note_gate",
+            "alert_gate",
+            "dedupe",
+            "frequency",
+            "publisher",
+            "final_result",
+            "rejection_reason",
+        ]:
+            print(f"{key}: {intraday_pipeline.get(key, 'UNKNOWN')}")
+        print()
+    daily_recap = funnel.get("daily_recap")
+    if daily_recap:
+        note = daily_recap.note
+        print("DAILY MARKET RECAP")
+        print(f"Eligible: {daily_recap.eligible}")
+        if note:
+            summary = note.intelligence_summary or {}
+            print(f"24h move: {summary.get('CURRENT_24H_MOVE', 'UNKNOWN')}")
+            print(f"Max 1h move 24h: {summary.get('MAX_MOVE_1H_24H', 'UNKNOWN')}")
+            print(f"Max 4h move 24h: {summary.get('MAX_MOVE_4H_24H', 'UNKNOWN')}")
+            print(f"Peak volume: {summary.get('MAX_VOLUME_RATIO_24H', 'UNKNOWN')}")
+            print(f"OI context: {summary.get('OI_CONTEXT_4H', 'UNKNOWN')}")
+            print(f"Structure: {summary.get('STRUCTURE', 'UNKNOWN')}")
+        else:
+            print("24h move: UNKNOWN")
+            print("Max 1h move 24h: UNKNOWN")
+            print("Max 4h move 24h: UNKNOWN")
+            print("Peak volume: UNKNOWN")
+            print("OI context: UNKNOWN")
+            print("Structure: UNKNOWN")
+        print("Recent relevant events:")
+        if daily_recap.recent_events:
+            for event in daily_recap.recent_events[:5]:
+                print(f"- {event.get('title')} ({event.get('source')})")
+        else:
+            print("None")
+        print(f"Score: {daily_recap.score}")
+        print(f"Decision: {daily_recap.decision}")
+        print(f"Duplicate: {daily_recap.duplicate}")
+        print(f"Image eligible: {getattr(note, 'image_eligible', False) if note else False}")
+        print(f"Published: {'yes' if daily_recap.published else 'no'}")
+        print(f"Reason: {daily_recap.reason}")
+        print()
     print("INTAKE / NOVELTY")
     print(format_intake_stats(funnel.get("intake_stats")))
     print()
@@ -513,6 +565,10 @@ def print_dry_run_report(news, messages, dry_run=True, shadow=False):
         print(f"Verification: {item.verification_status}")
         print(f"Confidence: {item.confidence}")
         print(f"Discountedness: {item.discountedness}")
+        print(f"Image eligible: {getattr(item, 'image_eligible', False)}")
+        if getattr(item, "image_brief", ""):
+            print("Generated image brief:")
+            print(item.image_brief)
         print()
         print("Por qué ha sobrevivido:")
         print(_why_survived(item))
@@ -520,6 +576,24 @@ def print_dry_run_report(news, messages, dry_run=True, shadow=False):
         print("Señales detectadas:")
         print(_list_text(item.market_signals))
         print()
+        interpretation = (item.intelligence_summary or {}).get("EDITORIAL_INTERPRETATION", {})
+        if interpretation:
+            print("EDITORIAL INTERPRETATION")
+            print(f"Story angle: {interpretation.get('story_angle', 'UNKNOWN')}")
+            print(f"Primary hypothesis: {interpretation.get('primary_hypothesis', 'UNKNOWN')}")
+            print(f"Alternative hypothesis: {interpretation.get('alternative_hypothesis', 'UNKNOWN')}")
+            print(f"Evidence for: {_list_text(interpretation.get('evidence_for', []))}")
+            print(f"Evidence against: {_list_text(interpretation.get('evidence_against', []))}")
+            print(f"Catalyst confidence: {interpretation.get('catalyst_confidence', 'UNKNOWN')}")
+            print(f"Interesting data selected: {_list_text(interpretation.get('interesting_data_selected', []))}")
+            print(f"Data omitted from publication: {_list_text(interpretation.get('data_omitted_from_publication', []))}")
+            print(f"What confirms: {interpretation.get('what_confirms', 'UNKNOWN')}")
+            print(f"What invalidates: {interpretation.get('what_invalidates', 'UNKNOWN')}")
+            print(f"News summary: {interpretation.get('news_summary', 'UNKNOWN')}")
+            print(f"Market interpretation: {interpretation.get('market_interpretation', 'UNKNOWN')}")
+            print(f"Analysis value ratio: {interpretation.get('analysis_value_ratio', 'UNKNOWN')}")
+            print(f"Editorial duplicate: {interpretation.get('editorial_duplicate', False)}")
+            print()
         print("TEXTO FINAL DE TELEGRAM:")
         print(message)
         print("========================================")

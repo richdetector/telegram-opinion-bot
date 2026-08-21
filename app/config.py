@@ -84,8 +84,18 @@ QUIET_MARKET_AFTER_HOURS = int(os.getenv("QUIET_MARKET_AFTER_HOURS") or 12)
 QUIET_MARKET_MAX_PER_DAY = int(os.getenv("QUIET_MARKET_MAX_PER_DAY") or 1)
 QUIET_MARKET_MIN_SCORE = int(os.getenv("QUIET_MARKET_MIN_SCORE") or 70)
 
+# BTC Today / Daily Recap: daily market-state lane, separate from intraday alerts.
+DAILY_RECAP_ENABLED = _env_bool("DAILY_RECAP_ENABLED", default=True)
+DAILY_RECAP_MAX_PER_DAY = int(os.getenv("DAILY_RECAP_MAX_PER_DAY") or 1)
+DAILY_RECAP_MIN_SCORE = int(os.getenv("DAILY_RECAP_MIN_SCORE") or 76)
+
 # Intraday BTC lane: separate from structural market alerts.
 INTRADAY_ENGINE_ENABLED = _env_bool("INTRADAY_ENGINE_ENABLED", default=True)
 INTRADAY_MIN_CONFLUENCE = int(os.getenv("INTRADAY_MIN_CONFLUENCE") or 75)
+INTRADAY_ALERT_MIN_CONFLUENCE = int(os.getenv("INTRADAY_ALERT_MIN_CONFLUENCE") or 70)
+INTRADAY_NOTE_MIN_CONFLUENCE = int(os.getenv("INTRADAY_NOTE_MIN_CONFLUENCE") or 58)
 INTRADAY_MAX_DATA_AGE_MINUTES = int(os.getenv("INTRADAY_MAX_DATA_AGE_MINUTES") or 10)
 INTRADAY_MAX_PER_4H = int(os.getenv("INTRADAY_MAX_PER_4H") or 2)
+
+# Editorial selection can include structural alerts plus daily/intraday lanes.
+EDITOR_MAX_SELECTED = int(os.getenv("EDITOR_MAX_SELECTED") or 6)

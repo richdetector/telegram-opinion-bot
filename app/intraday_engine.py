@@ -1,7 +1,11 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from config import INTRADAY_MAX_DATA_AGE_MINUTES, INTRADAY_MIN_CONFLUENCE
+from config import (
+    INTRADAY_ALERT_MIN_CONFLUENCE,
+    INTRADAY_MAX_DATA_AGE_MINUTES,
+    INTRADAY_NOTE_MIN_CONFLUENCE,
+)
 from market_data import BinanceMarketDataClient, _mean, _pct_change, _safe_float, _stdev
 from models import NewsItem
 from sources_registry import apply_source_metadata
@@ -97,6 +101,7 @@ class BtcIntradayState:
     invalidation: str = ""
     status: str = "UNKNOWN"
     data_available: dict[str, bool] = field(default_factory=dict)
+    move_state: str = "UNKNOWN"
 
 
 def _now():
@@ -443,22 +448,88 @@ def fetch_btc_intraday_snapshot(client=None, liquidity_structure=None):
 
 
 def _score_move(snapshot):
-    scores = []
+    speed_scores = []
     inputs = [
-        (snapshot.price_change_15m, 3.0, 26),
-        (snapshot.price_change_30m, 2.2, 22),
-        (snapshot.price_change_1h, 1.6, 20),
-        (snapshot.price_change_4h, 1.0, 14),
+        (snapshot.price_change_15m, 3.6, 24),
+        (snapshot.price_change_30m, 2.8, 22),
+        (snapshot.price_change_1h, 2.0, 20),
+        (snapshot.price_change_4h, 1.45, 18),
+        (snapshot.price_change_24h, 0.55, 10),
     ]
     for change, multiplier, weight in inputs:
         if change is not None:
-            scores.append(min(100, abs(change) * multiplier * weight))
-    base = max(scores) if scores else 0
-    if snapshot.volume_ratio_1h is not None and snapshot.volume_ratio_1h >= 1.8:
-        base += 12
-    if snapshot.volatility_ratio_1h is not None and snapshot.volatility_ratio_1h >= 1.8:
-        base += 12
-    return _clamp(base)
+            speed_scores.append(min(100, abs(change) * multiplier * weight))
+    base = max(speed_scores) if speed_scores else 0
+
+    volume_bonus = 0
+    for ratio, cap in [
+        (snapshot.volume_ratio_15m, 14),
+        (snapshot.volume_ratio_1h, 18),
+        (snapshot.volume_ratio_4h, 24),
+    ]:
+        if ratio is not None and ratio >= 1.6:
+            volume_bonus = max(volume_bonus, min(cap, (ratio - 1.0) * 10))
+
+    volatility_bonus = 0
+    for ratio, cap in [
+        (snapshot.volatility_ratio_15m, 10),
+        (snapshot.volatility_ratio_1h, 14),
+        (snapshot.volatility_ratio_4h, 18),
+    ]:
+        if ratio is not None and ratio >= 1.5:
+            volatility_bonus = max(volatility_bonus, min(cap, (ratio - 1.0) * 9))
+
+    return _clamp(base + volume_bonus + volatility_bonus)
+
+
+def _intraday_decision(score):
+    if score >= INTRADAY_ALERT_MIN_CONFLUENCE:
+        return "INTRADAY_ALERT"
+    if score >= INTRADAY_NOTE_MIN_CONFLUENCE:
+        return "INTRADAY_NOTE"
+    return "NO_ACTION"
+
+
+def _move_state(state):
+    if state.decision == "INTRADAY_ALERT":
+        return "NEW_MOVE"
+    if state.decision == "INTRADAY_NOTE":
+        return "NEW_MOVE"
+    return "NONE"
+
+
+def intraday_event_fingerprint(state):
+    if state is None:
+        return "intraday:none"
+    snapshot = state.snapshot
+    direction = _direction(snapshot)
+    level = round((snapshot.price or 0) / 250) * 250 if snapshot.price else 0
+    return f"btc:{direction}:{snapshot.structure_4h}:{level}:{state.intraday_materiality}"
+
+
+def intraday_update_type(previous, current):
+    if previous is None or current is None:
+        return "NEW_MOVE" if current is not None else "NONE"
+    if current.decision == "NO_ACTION":
+        return "NONE"
+    if previous.decision == "NO_ACTION":
+        return "NEW_MOVE"
+    if intraday_event_fingerprint(previous) == intraday_event_fingerprint(current):
+        old_score = previous.intraday_confluence_score
+        new_score = current.intraday_confluence_score
+        old_change = abs(previous.snapshot.price_change_4h or 0)
+        new_change = abs(current.snapshot.price_change_4h or 0)
+        old_oi = abs(previous.snapshot.oi_change_4h or previous.snapshot.oi_change_1h or 0)
+        new_oi = abs(current.snapshot.oi_change_4h or current.snapshot.oi_change_1h or 0)
+        if (
+            current.catalyst_status != previous.catalyst_status
+            or new_score >= old_score + 12
+            or new_change >= old_change + 1.0
+            or new_oi >= old_oi + 1.5
+        ):
+            return "MATERIAL_UPDATE"
+        return "DUPLICATE_MOVE"
+    return "MATERIAL_UPDATE"
 
 
 def _score_liquidity(snapshot):
@@ -509,17 +580,28 @@ def _score_smc(snapshot, signals):
 def _materiality(score):
     if score >= 90:
         return "INTRADAY_CRITICAL"
-    if score >= 75:
+    if score >= INTRADAY_ALERT_MIN_CONFLUENCE:
         return "INTRADAY_HIGH"
-    if score >= 55:
+    if score >= INTRADAY_NOTE_MIN_CONFLUENCE:
         return "INTRADAY_MEDIUM"
     return "INTRADAY_LOW"
 
 
 def _direction(snapshot):
-    change = snapshot.price_change_1h
-    if change is None:
-        change = snapshot.price_change_4h
+    change_1h = snapshot.price_change_1h
+    change_4h = snapshot.price_change_4h
+    if (
+        change_4h is not None
+        and abs(change_4h) >= 1.5
+        and (change_1h is None or abs(change_4h) >= abs(change_1h) * 2)
+    ):
+        change = change_4h
+    elif change_1h is not None and abs(change_1h) >= 0.25:
+        change = change_1h
+    elif change_4h is not None and abs(change_4h) >= 0.75:
+        change = change_4h
+    else:
+        change = change_1h if change_1h is not None else change_4h
     if change is None:
         return "FLAT"
     if change >= 0.25:
@@ -586,50 +668,84 @@ def analyze_btc_intraday_state(snapshot, liquidity_structure=None):
     direction = _direction(snapshot)
 
     move_score = _score_move(snapshot)
-    if direction == "UP" and move_score >= 55:
+    if direction == "UP" and move_score >= 42:
         _add_signal(
             signals,
             "PRICE_ACCELERATION_UP",
-            "15m-1h",
+            "15m-4h",
             move_score,
             "CALCULATED",
             f"BTC change: 15m={snapshot.price_change_15m}, 1h={snapshot.price_change_1h}, 4h={snapshot.price_change_4h}",
         )
-    elif direction == "DOWN" and move_score >= 55:
+    elif direction == "DOWN" and move_score >= 42:
         _add_signal(
             signals,
             "PRICE_ACCELERATION_DOWN",
-            "15m-1h",
+            "15m-4h",
             move_score,
             "CALCULATED",
             f"BTC change: 15m={snapshot.price_change_15m}, 1h={snapshot.price_change_1h}, 4h={snapshot.price_change_4h}",
         )
 
-    if snapshot.volume_ratio_1h is not None and snapshot.volume_ratio_1h >= 1.8:
+    best_volume_ratio = max(
+        [
+            value
+            for value in [
+                snapshot.volume_ratio_15m,
+                snapshot.volume_ratio_1h,
+                snapshot.volume_ratio_4h,
+            ]
+            if value is not None
+        ]
+        or [None]
+    )
+    best_volume_tf = "4h"
+    if snapshot.volume_ratio_1h == best_volume_ratio:
+        best_volume_tf = "1h"
+    if snapshot.volume_ratio_15m == best_volume_ratio:
+        best_volume_tf = "15m"
+    if best_volume_ratio is not None and best_volume_ratio >= 1.8:
         _add_signal(
             signals,
             "VOLUME_EXPANSION",
-            "1h",
-            min(100, snapshot.volume_ratio_1h * 28),
+            best_volume_tf,
+            min(100, best_volume_ratio * 28),
             "CALCULATED",
-            f"1h volume is {snapshot.volume_ratio_1h:.2f}x recent baseline.",
+            f"{best_volume_tf} volume is {best_volume_ratio:.2f}x recent baseline.",
         )
-    if snapshot.volatility_ratio_1h is not None and snapshot.volatility_ratio_1h >= 1.8:
+    best_volatility_ratio = max(
+        [
+            value
+            for value in [
+                snapshot.volatility_ratio_15m,
+                snapshot.volatility_ratio_1h,
+                snapshot.volatility_ratio_4h,
+            ]
+            if value is not None
+        ]
+        or [None]
+    )
+    best_volatility_tf = "4h"
+    if snapshot.volatility_ratio_1h == best_volatility_ratio:
+        best_volatility_tf = "1h"
+    if snapshot.volatility_ratio_15m == best_volatility_ratio:
+        best_volatility_tf = "15m"
+    if best_volatility_ratio is not None and best_volatility_ratio >= 1.8:
         _add_signal(
             signals,
             "VOLATILITY_EXPANSION",
-            "1h",
-            min(100, snapshot.volatility_ratio_1h * 28),
+            best_volatility_tf,
+            min(100, best_volatility_ratio * 28),
             "CALCULATED",
-            f"1h realized range is {snapshot.volatility_ratio_1h:.2f}x recent baseline.",
+            f"{best_volatility_tf} realized range is {best_volatility_ratio:.2f}x recent baseline.",
         )
 
-    if snapshot.volume_ratio_1h is not None and snapshot.volume_ratio_1h >= 1.6 and direction in {"UP", "DOWN"}:
+    if best_volume_ratio is not None and best_volume_ratio >= 1.6 and direction in {"UP", "DOWN"}:
         _add_signal(
             signals,
             "VOLUME_CONFIRMATION",
-            "1h",
-            min(100, snapshot.volume_ratio_1h * 25),
+            best_volume_tf,
+            min(100, best_volume_ratio * 25),
             "CALCULATED",
             "Volume expansion is aligned with the intraday move.",
         )
@@ -674,7 +790,39 @@ def analyze_btc_intraday_state(snapshot, liquidity_structure=None):
     elif direction == "FLAT" and snapshot.oi_change_1h is not None and snapshot.oi_change_1h >= 3:
         _add_signal(signals, "LEVERAGE_BUILDING_COMPRESSION", "1h", 68, "INFERRED", "OI rises while price remains compressed.", "BINANCE_OI")
 
-    if direction in {"UP", "DOWN"} and snapshot.volume_ratio_1h is not None and snapshot.volume_ratio_1h < 1.2:
+    if direction == "UP" and snapshot.oi_change_4h is not None and snapshot.oi_change_4h >= 2 and not any(signal.source == "BINANCE_OI" for signal in signals):
+        _add_signal(signals, "MOMENTUM_WITH_LEVERAGE_BUILDUP", "4h", 72, "INFERRED", "Price up with 4h OI rising; consistent with new leveraged positioning.", "BINANCE_OI")
+    elif direction == "DOWN" and snapshot.oi_change_4h is not None and snapshot.oi_change_4h <= -2 and not any(signal.source == "BINANCE_OI" for signal in signals):
+        _add_signal(signals, "DELEVERAGING_STYLE_MOVE", "4h", 74, "INFERRED", "Price down with 4h OI falling; consistent with deleveraging dynamics.", "BINANCE_OI")
+
+    aligned_up = (
+        (snapshot.price_change_15m or 0) > 0
+        and (snapshot.price_change_1h or 0) > 0
+        and (snapshot.price_change_4h or 0) > 0
+    )
+    aligned_down = (
+        (snapshot.price_change_15m or 0) < 0
+        and (snapshot.price_change_1h or 0) < 0
+        and (snapshot.price_change_4h or 0) < 0
+    )
+    if aligned_up or aligned_down or (
+        snapshot.price_change_4h is not None
+        and abs(snapshot.price_change_4h) >= 2
+        and snapshot.price_change_24h is not None
+        and abs(snapshot.price_change_24h) >= 5
+    ):
+        _add_signal(
+            signals,
+            "MULTI_TIMEFRAME_MOMENTUM",
+            "15m-24h",
+            68,
+            "CALCULATED",
+            "Several intraday horizons point to the same expansion regime.",
+            "BINANCE_KLINES",
+        )
+
+    weak_volume_ratio = best_volume_ratio if best_volume_ratio is not None else snapshot.volume_ratio_1h
+    if direction in {"UP", "DOWN"} and weak_volume_ratio is not None and weak_volume_ratio < 1.2:
         _add_signal(signals, "VOLUME_DIVERGENCE", "1h", 45, "CALCULATED", "Fast price move lacks clear volume expansion.", "BINANCE_KLINES")
 
     liquidity_score = _score_liquidity(snapshot)
@@ -692,30 +840,77 @@ def analyze_btc_intraday_state(snapshot, liquidity_structure=None):
     derivatives_score = max([signal.strength for signal in signals if signal.source == "BINANCE_OI"] or [0])
     volume_score = max([signal.strength for signal in signals if signal.name.startswith("VOLUME")] or [0])
     volatility_score = max([signal.strength for signal in signals if signal.name == "VOLATILITY_EXPANSION"] or [0])
+    structure_score = max(
+        [
+            signal.strength
+            for signal in signals
+            if signal.source == "STRUCTURE_INFERRED"
+            and (
+                "BREAKOUT" in signal.name
+                or "BREAK_OF_STRUCTURE" in signal.name
+                or "SWEEP" in signal.name
+            )
+        ]
+        or [0]
+    )
     confluence = (
-        move_score * 0.36
-        + volume_score * 0.14
-        + volatility_score * 0.10
-        + derivatives_score * 0.16
-        + liquidity_score * 0.10
-        + smc_score * 0.08
+        move_score * 0.34
+        + volume_score * 0.17
+        + volatility_score * 0.11
+        + derivatives_score * 0.17
+        + structure_score * 0.10
+        + liquidity_score * 0.06
+        + smc_score * 0.05
     )
 
     if independent["price"] and independent["volume"] and independent["oi"]:
+        confluence += 10
+    if independent["price"] and independent["volume"] and independent["structure"]:
+        confluence += 8
+    if independent["price"] and derivatives_score and volatility_score:
+        confluence += 6
+    if independent["price"] and independent["volume"] and independent["oi"] and independent["structure"]:
+        confluence += 6
+    if move_score >= 50 and volume_score >= 70 and derivatives_score >= 70 and smc_score >= 70:
+        confluence += 8
+    if (
+        abs(snapshot.price_change_24h or 0) >= 6
+        and abs(snapshot.price_change_4h or 0) >= 1
+        and volume_score >= 70
+        and volatility_score >= 50
+    ):
+        confluence += 8
+    if (
+        abs(snapshot.price_change_24h or 0) >= 7
+        and independent["volume"]
+        and independent["structure"]
+        and (independent["oi"] or independent["liquidity"])
+    ):
+        confluence += 6
+    if (
+        snapshot.structure_4h in {"BULLISH_BREAKOUT", "BEARISH_BREAKOUT"}
+        and volume_score >= 70
+        and derivatives_score >= 60
+    ):
         confluence += 6
 
     if independent_count < 2 and move_score < 92:
         confluence = min(confluence, 54)
-    if independent_count < 3 and move_score < 88:
+    if independent_count < 3 and move_score < 82:
         confluence = min(confluence, 72)
     if not _fresh_enough(snapshot):
         confluence = min(confluence, 40)
     if snapshot.status == "DEGRADED":
         confluence = min(confluence, 88)
+    if (
+        abs(snapshot.price_change_1h or 0) < 2.0
+        and abs(snapshot.price_change_4h or 0) < 4.0
+    ):
+        confluence = min(confluence, 88)
 
     confluence = _clamp(confluence)
     materiality = _materiality(confluence)
-    decision = "INTRADAY_CANDIDATE" if confluence >= INTRADAY_MIN_CONFLUENCE and materiality in {"INTRADAY_HIGH", "INTRADAY_CRITICAL"} else "NO_INTRADAY_ALERT"
+    decision = _intraday_decision(confluence)
 
     if direction == "UP" and derivatives_score:
         reading = "El movimiento es compatible con momentum de corto plazo y apertura/cierre de apalancamiento, no con una causa demostrada."
@@ -741,6 +936,7 @@ def analyze_btc_intraday_state(snapshot, liquidity_structure=None):
         invalidation=invalidation,
         status=snapshot.status,
         data_available=dict(snapshot.data_available),
+        move_state="NEW_MOVE" if decision in {"INTRADAY_NOTE", "INTRADAY_ALERT"} else "NONE",
     )
 
 
@@ -775,12 +971,20 @@ def attach_intraday_catalyst(state, news_items):
             state.catalyst_source = item.source
             state.catalyst_confidence = "Media"
             state.intraday_news_relevance = 75
+            state.intraday_confluence_score = _clamp(state.intraday_confluence_score + 8)
+            state.intraday_materiality = _materiality(state.intraday_confluence_score)
+            state.decision = _intraday_decision(state.intraday_confluence_score)
+            state.move_state = "NEW_MOVE" if state.decision in {"INTRADAY_NOTE", "INTRADAY_ALERT"} else "NONE"
             return state
         if item.source_type in {"FAST", "COMMUNITY"}:
             state.catalyst_status = "POSSIBLE_CATALYST"
             state.catalyst_source = item.source
             state.catalyst_confidence = "Baja"
             state.intraday_news_relevance = max(state.intraday_news_relevance, 45)
+            state.intraday_confluence_score = _clamp(state.intraday_confluence_score + 4)
+            state.intraday_materiality = _materiality(state.intraday_confluence_score)
+            state.decision = _intraday_decision(state.intraday_confluence_score)
+            state.move_state = "NEW_MOVE" if state.decision in {"INTRADAY_NOTE", "INTRADAY_ALERT"} else "NONE"
             return state
     state.catalyst_status = "NO_CLEAR_CATALYST"
     return state
@@ -795,14 +999,19 @@ def _fmt(value, suffix=""):
 
 
 def intraday_state_to_news_item(state):
-    if state is None or state.decision != "INTRADAY_CANDIDATE":
+    if state is None or state.decision not in {"INTRADAY_NOTE", "INTRADAY_ALERT"}:
         return None
 
     snapshot = state.snapshot
     direction = _direction(snapshot)
     direction_text = "acelera al alza" if direction == "UP" else "cae con fuerza" if direction == "DOWN" else "se mueve con fuerza"
-    materiality = "CRITICAL" if state.intraday_materiality == "INTRADAY_CRITICAL" else "HIGH"
-    impact = max(INTRADAY_MIN_CONFLUENCE, state.intraday_confluence_score)
+    if state.intraday_materiality == "INTRADAY_CRITICAL":
+        materiality = "CRITICAL"
+    elif state.intraday_materiality == "INTRADAY_HIGH":
+        materiality = "HIGH"
+    else:
+        materiality = "MEDIUM"
+    impact = state.intraday_confluence_score
     signal_names = [signal.name for signal in state.signals]
 
     content = "\n".join(
@@ -833,7 +1042,7 @@ def intraday_state_to_news_item(state):
         link=f"market-state:btc-intraday:{direction}:{snapshot.structure_1h}:{snapshot.timestamp[:13]}",
         published=snapshot.timestamp,
         source="MARKET_STATE",
-        category="BTC Intraday",
+        category="BTC Intraday" if state.decision == "INTRADAY_ALERT" else "BTC Intraday Note",
         event_type="BTC_INTRADAY_MOVE",
         affected_assets=["BTC"],
         asset_class="CRYPTO",
@@ -851,12 +1060,31 @@ def intraday_state_to_news_item(state):
         mechanism_of_impact="DIRECT",
         editorial_quality=70,
     )
+    item.intraday_news_relevance = state.intraday_confluence_score
+    item.daily_news_relevance = max(0, min(100, int(state.intraday_confluence_score * 0.75)))
+    item.structural_news_relevance = item.market_impact
+    item.accepted_by = ["INTRADAY"]
     item.intelligence_summary = {
         "INTRADAY_CONFLUENCE": state.intraday_confluence_score,
         "MOVE_ABNORMALITY": state.move_abnormality_score,
         "LIQUIDITY": state.liquidity_importance_score,
         "SMC": state.smc_confluence_score,
         "CATALYST": state.catalyst_status,
+        "CATALYST_EVENT_STATUS": "CONFIRMED_EVENT" if state.catalyst_status == "CONFIRMED_CATALYST" else "NO_CONFIRMED_EVENT",
+        "CATALYST_CAUSALITY_CONFIDENCE": "POSSIBLE" if state.catalyst_status == "CONFIRMED_CATALYST" else "UNKNOWN",
+        "CATALYST_SOURCE": state.catalyst_source,
+        "INTRADAY_DECISION": state.decision,
+        "MOVE_STATE": state.move_state,
         "MARKET_DATA_AGE_MINUTES": snapshot.market_data_age_minutes,
+        "CURRENT_24H_MOVE": snapshot.price_change_24h,
+        "PRICE_CHANGE_15M": snapshot.price_change_15m,
+        "PRICE_CHANGE_1H": snapshot.price_change_1h,
+        "PRICE_CHANGE_4H": snapshot.price_change_4h,
+        "OI_CHANGE_15M": snapshot.oi_change_15m,
+        "OI_CHANGE_1H": snapshot.oi_change_1h,
+        "OI_CONTEXT_4H": snapshot.oi_change_4h,
+        "VOLUME_RATIO_15M": snapshot.volume_ratio_15m,
+        "VOLATILITY_RATIO_15M": snapshot.volatility_ratio_15m,
+        "STRUCTURE": f"15m={snapshot.structure_15m}, 1h={snapshot.structure_1h}, 4h={snapshot.structure_4h}",
     }
     return item

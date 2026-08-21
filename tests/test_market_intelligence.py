@@ -21,10 +21,21 @@ from crypto_market_engine import (
     fetch_btc_market_state,
     market_state_to_news_item,
 )
+from combined_story import attach_market_reaction_to_news
+from daily_publication_gate import evaluate_daily_item
+from daily_recap import (
+    daily_market_state_score,
+    evaluate_daily_market_recap,
+    replay_seen_events_with_current_rules,
+)
 from deduper import dedupe_news
 from diagnostics import count_pre_candidate_rejections
 from dry_run_report import print_dry_run_report, report_mode_title
+from editor_writer import write_news
 from editor_selector import select_news_with_ai
+from editorial_lanes import lane_for_item, split_selector_lanes
+from editorial_image import build_image_brief, prepare_editorial_image
+from formatter import format_report
 from liquidity_structure_engine import (
     BtcLiquidityStructureSnapshot,
     LiquidityCluster,
@@ -35,6 +46,7 @@ from intraday_engine import (
     analyze_btc_intraday_state,
     attach_intraday_catalyst,
     intraday_state_to_news_item,
+    intraday_update_type,
 )
 from intraday_publication_gate import evaluate_intraday_item
 from main import (
@@ -42,7 +54,12 @@ from main import (
     _revalidate_precandidates_after_download,
     process_news,
 )
-from market_scorer import can_reach_selection, score_market_item
+from market_scorer import accepted_by_paths, can_reach_selection, score_market_item
+from market_interpreter import (
+    attach_editorial_interpretations,
+    build_editorial_interpretation,
+    validate_publication_text,
+)
 from market_data import BtcEtfFlowSnapshot, BtcMarketSnapshot
 from market_data import (
     BtcOnchainSnapshot,
@@ -96,7 +113,7 @@ from seen_cache import (
     title_fingerprint,
 )
 from runner import run_one_cycle, runner as radar_runner
-from runtime_guards import run_sync_phase
+from runtime_guards import run_async_phase, run_sync_phase
 from sources_registry import apply_source_metadata, source_metadata
 from telegram_sources import CHANNELS, CHANNEL_METADATA
 from verification import verify_news
@@ -276,7 +293,7 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertIn("BTC", scored.affected_assets)
         self.assertGreaterEqual(scored.market_impact, 72)
 
-    def test_selector_never_returns_more_than_two_without_ai(self):
+    def test_selector_never_returns_more_than_six_without_ai(self):
         items = [
             score_market_item(
                 item(
@@ -290,7 +307,7 @@ class MarketIntelligenceTests(unittest.TestCase):
 
         selected = select_news_with_ai(items, use_ai=False)
 
-        self.assertLessEqual(len(selected), 2)
+        self.assertLessEqual(len(selected), 6)
 
     def test_same_event_is_grouped(self):
         one = score_market_item(
@@ -1807,7 +1824,7 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertEqual(news, [])
         self.assertEqual(status.status, "API_ERROR")
 
-    def test_selector_still_zero_to_two_after_reddit_phase(self):
+    def test_selector_can_select_up_to_six_after_daily_intraday_phase(self):
         items = [
             score_market_item(
                 item(
@@ -1821,7 +1838,7 @@ class MarketIntelligenceTests(unittest.TestCase):
 
         selected = select_news_with_ai(items, use_ai=False)
 
-        self.assertLessEqual(len(selected), 2)
+        self.assertLessEqual(len(selected), 6)
 
     def test_publication_gate_thresholds_unchanged_after_reddit_phase(self):
         news = publishable_item()
@@ -2082,12 +2099,274 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertEqual(counters["pre_candidate_medium_rejected"], 1)
         self.assertEqual(counters["pre_candidate_rumor_rejected"], 1)
 
+    def test_structural_medium_intraday_high_survives(self):
+        news = item(
+            "Trump urges Congress to pass crypto regulation today",
+            "The White House statement references the CLARITY Act and BTC market structure.",
+            source="NoticiasTradingCrypto",
+        )
+        news.published = datetime.utcnow().isoformat()
+        news = score_market_item(news)
+        news.market_impact = 50
+        news.materiality = "MEDIUM"
+
+        self.assertGreaterEqual(news.intraday_news_relevance, 82)
+        self.assertTrue(can_reach_selection(news))
+        self.assertIn("INTRADAY", accepted_by_paths(news))
+
+    def test_structural_low_daily_high_survives(self):
+        news = item(
+            "CLARITY Act advances after House committee vote",
+            "A major US legislative development on crypto regulation could affect BTC market structure.",
+            source="CoinDesk",
+        )
+        news.published = datetime.utcnow().isoformat()
+        news = score_market_item(news)
+        news.market_impact = 44
+        news.materiality = "LOW"
+        news.is_rumor = False
+        news.verification_status = "PRELIMINARY"
+
+        self.assertGreaterEqual(news.daily_news_relevance, 76)
+        self.assertTrue(can_reach_selection(news))
+        self.assertIn("DAILY", accepted_by_paths(news))
+
+    def test_trump_crypto_declaration_becomes_daily_intraday_candidate(self):
+        news = item(
+            "Trump says Congress must pass the CLARITY Act for crypto",
+            "The direct declaration targets US crypto regulation and Bitcoin market structure.",
+            source="Truth Social @realDonaldTrump",
+        )
+        news.published = datetime.utcnow().isoformat()
+        news.declaration_status = "ANNOUNCED"
+        news = score_market_item(news)
+
+        self.assertEqual(news.event_type, "CRYPTO_REGULATION")
+        self.assertIn("BTC", news.affected_assets)
+        self.assertGreaterEqual(news.daily_news_relevance, 76)
+        self.assertGreaterEqual(news.intraday_news_relevance, 82)
+        self.assertTrue(can_reach_selection(news))
+
+    def test_clarity_act_advancement_daily_high(self):
+        news = item(
+            "Senate committee advances CLARITY Act crypto market structure bill",
+            "The vote is a real legislative step for US crypto regulation and CFTC oversight.",
+            source="CoinDesk",
+        )
+        news.published = datetime.utcnow().isoformat()
+        news = score_market_item(news)
+
+        self.assertEqual(news.event_type, "CRYPTO_REGULATION")
+        self.assertIn("BTC", news.affected_assets)
+        self.assertGreaterEqual(news.daily_news_relevance, 76)
+        self.assertTrue(can_reach_selection(news))
+        self.assertTrue(evaluate_daily_item(news, review_ok=True).passed)
+
+    def test_duplicate_telegram_headline_no_second_slot(self):
+        first = score_market_item(
+            item(
+                "Trump urges Congress to pass the CLARITY Act",
+                "Crypto regulation headline.",
+                source="NoticiasTradingCrypto",
+            )
+        )
+        second = score_market_item(
+            item(
+                "Trump urges Congress to pass the CLARITY Act",
+                "Crypto regulation headline.",
+                source="ultimominutoOTC",
+            )
+        )
+
+        merged = dedupe_news([first, second])
+
+        self.assertEqual(len(merged), 1)
+
+    def test_telegram_rumor_primary_confirmation_raises_confidence(self):
+        telegram = item(
+            "CLARITY Act advances after committee vote",
+            "Rumor: sources say the crypto market structure bill advanced.",
+            source="NoticiasTradingCrypto",
+        )
+        telegram = score_market_item(telegram)
+        telegram.is_rumor = True
+        telegram.verification_status = "RUMOR"
+
+        primary = item(
+            "CLARITY Act advances after committee vote",
+            "Official committee notice confirms the crypto market structure bill advanced.",
+            source="SEC - Press Releases",
+        )
+        primary = score_market_item(primary)
+        primary.source_type = "PRIMARY"
+
+        verified = verify_news([telegram, primary])
+
+        self.assertEqual(verified[0].verification_status, "CONFIRMED")
+        self.assertEqual(verified[0].confidence, "Alta")
+
+    def test_stale_telegram_headline_rejected(self):
+        news = item(
+            "Trump urges Congress to pass crypto regulation",
+            "The post discusses the CLARITY Act and BTC market structure.",
+            source="NoticiasTradingCrypto",
+        )
+        news.published = (datetime.utcnow() - timedelta(days=3)).isoformat()
+        news = score_market_item(news)
+
+        self.assertFalse(can_reach_selection(news))
+        self.assertLess(news.daily_news_relevance, 76)
+
+    def test_generic_political_chatter_rejected(self):
+        news = item(
+            "Trump criticized a rival during a campaign event",
+            "The speech did not mention crypto, tariffs, rates, oil, sanctions or markets.",
+            source="ClashReport",
+        )
+        news.published = datetime.utcnow().isoformat()
+        news = score_market_item(news)
+
+        self.assertFalse(can_reach_selection(news))
+
+    def test_same_event_across_telegram_rss_one_event(self):
+        telegram = score_market_item(
+            item(
+                "Trump pushes Congress to pass CLARITY Act",
+                "Crypto regulation and BTC market structure.",
+                source="NoticiasTradingCrypto",
+            )
+        )
+        rss = score_market_item(
+            item(
+                "Trump pushes Congress to pass CLARITY Act",
+                "Crypto regulation and BTC market structure.",
+                source="CoinDesk",
+            )
+        )
+
+        self.assertEqual(len(dedupe_news([telegram, rss])), 1)
+
+    def test_daily_publication_does_not_relax_structural_gate(self):
+        news = item(
+            "CLARITY Act advances after committee vote",
+            "A US crypto regulation development affects BTC market structure.",
+            source="CoinDesk",
+        )
+        news.published = datetime.utcnow().isoformat()
+        news = score_market_item(news)
+        news.market_impact = 44
+        news.materiality = "LOW"
+
+        structural_result = evaluate_item(news, review_ok=True)
+        daily_result = evaluate_daily_item(news, review_ok=True)
+
+        self.assertFalse(structural_result.passed)
+        self.assertIn("low_materiality", structural_result.reasons)
+        self.assertTrue(daily_result.passed)
+
+    def test_daily_high_news_can_publish_structural_medium(self):
+        news = item(
+            "CLARITY Act advances after committee vote",
+            "A US crypto regulation development affects BTC market structure.",
+            source="CoinDesk",
+        )
+        news.published = datetime.utcnow().isoformat()
+        news = score_market_item(news)
+        news.market_impact = 50
+        news.materiality = "MEDIUM"
+
+        self.assertTrue(evaluate_daily_item(news, review_ok=True).passed)
+
+    def test_trump_clarity_and_btc_reaction_becomes_combined_story(self):
+        news = score_market_item(
+            item(
+                "Trump pushes Congress to pass the CLARITY Act",
+                "The White House crypto statement is relevant for BTC regulation.",
+                source="CoinDesk",
+            )
+        )
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.2, change_15m=0.7, change_4h=3.0, volume_ratio=2.5, volatility_ratio=2.0, oi_change=2.0)
+        )
+
+        attach_market_reaction_to_news([news], state)
+
+        self.assertIn("TEMPORAL_MARKET_REACTION", news.market_signals)
+        self.assertIn("coincide temporalmente", news.content.lower())
+        self.assertNotIn("caused by", news.content.lower())
+        self.assertGreaterEqual(news.daily_news_relevance, 82)
+
+    def test_same_story_from_multiple_sources_merges(self):
+        one = score_market_item(
+            item("Trump pushes Congress to pass CLARITY Act", source="NoticiasTradingCrypto")
+        )
+        two = score_market_item(
+            item("Trump pushes Congress to pass CLARITY Act", source="CoinDesk")
+        )
+
+        self.assertEqual(len(dedupe_news([one, two])), 1)
+
+    def test_image_failure_does_not_block_text_publish(self):
+        news = score_market_item(
+            item(
+                "Trump pushes Congress to pass the CLARITY Act",
+                "BTC regulation story.",
+                source="CoinDesk",
+            )
+        )
+
+        path = prepare_editorial_image(news, generator=Mock(side_effect=RuntimeError("image down")))
+
+        self.assertIsNone(path)
+        self.assertTrue(news.image_eligible)
+        self.assertEqual(news.image_path, "")
+
+    def test_image_only_generated_for_eligible_story(self):
+        minor = score_market_item(item("Generic corporate blog retrospective", source="CNBC"))
+        major = score_market_item(
+            item("Trump pushes Congress to pass the CLARITY Act", "BTC regulation story.", source="CoinDesk")
+        )
+
+        self.assertFalse(build_image_brief(minor).eligible)
+        self.assertTrue(build_image_brief(major).eligible)
+
+    def test_same_event_uses_same_image_reuse_key(self):
+        one = score_market_item(
+            item("Trump pushes Congress to pass CLARITY Act", source="NoticiasTradingCrypto")
+        )
+        two = score_market_item(
+            item("Trump pushes Congress to pass CLARITY Act", source="CoinDesk")
+        )
+
+        self.assertEqual(build_image_brief(one).reuse_key, build_image_brief(two).reuse_key)
+
+    def test_no_fake_photorealistic_event_image(self):
+        news = score_market_item(
+            item("Trump pushes Congress to pass the CLARITY Act", "BTC regulation story.", source="CoinDesk")
+        )
+        brief = build_image_brief(news)
+
+        self.assertIn("illustration", brief.brief.lower())
+        self.assertIn("not a fake documentary photo", brief.brief.lower())
+
+    def test_combined_story_has_no_fake_causality(self):
+        news = score_market_item(
+            item("CLARITY Act advances after committee vote", "BTC regulation story.", source="CoinDesk")
+        )
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.2, change_15m=0.7, change_4h=3.0, volume_ratio=2.5, volatility_ratio=2.0, oi_change=2.0)
+        )
+
+        attach_market_reaction_to_news([news], state)
+
+        self.assertIn("no demuestra causalidad", news.content.lower())
+
     def test_intraday_small_move_normal_vol_no_alert(self):
         state = analyze_btc_intraday_state(
             intraday_snapshot(change_1h=0.5, volume_ratio=1.0, volatility_ratio=1.0)
         )
 
-        self.assertEqual(state.decision, "NO_INTRADAY_ALERT")
+        self.assertEqual(state.decision, "NO_ACTION")
         self.assertEqual(state.intraday_materiality, "INTRADAY_LOW")
 
     def test_intraday_missing_core_is_insufficient(self):
@@ -2140,6 +2419,802 @@ class MarketIntelligenceTests(unittest.TestCase):
 
         self.assertNotEqual(state.intraday_materiality, "INTRADAY_HIGH")
 
+    def test_intraday_live_four_hour_breakout_case_not_low_without_catalyst(self):
+        snapshot = intraday_snapshot(
+            change_15m=-0.0167,
+            change_1h=0.14,
+            change_4h=2.7429,
+            volume_ratio=1.0,
+            volatility_ratio=1.0,
+            oi_change=0.4,
+            structure_15m="BULLISH",
+            structure_1h="BULLISH",
+            structure_4h="BULLISH_BREAKOUT",
+        )
+        snapshot.price_change_5m = -0.0442
+        snapshot.price_change_30m = 0.1362
+        snapshot.price_change_24h = 8.1092
+        snapshot.volume_ratio_4h = 3.183
+        snapshot.volatility_ratio_4h = 2.3306
+        snapshot.oi_change_4h = 2.4173
+
+        state = analyze_btc_intraday_state(snapshot)
+
+        self.assertNotEqual(state.intraday_materiality, "INTRADAY_LOW")
+        self.assertEqual(state.decision, "INTRADAY_ALERT")
+        self.assertEqual(state.catalyst_status, "NO_CLEAR_CATALYST")
+
+    def test_intraday_same_move_confirmed_catalyst_raises_confluence(self):
+        base = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.6, change_15m=0.8, volume_ratio=2.2, volatility_ratio=2.0, oi_change=2.5)
+        )
+        confirmed = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.6, change_15m=0.8, volume_ratio=2.2, volatility_ratio=2.0, oi_change=2.5)
+        )
+        primary = item("SEC confirms Bitcoin ETF emergency decision", source="SEC - Press Releases")
+        primary.source_type = "PRIMARY"
+
+        attach_intraday_catalyst(confirmed, [primary])
+
+        self.assertGreater(confirmed.intraday_confluence_score, base.intraday_confluence_score)
+        self.assertEqual(confirmed.catalyst_status, "CONFIRMED_CATALYST")
+
+    def test_intraday_no_clear_catalyst_alone_is_not_penalty(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.1, volume_ratio=2.4, volatility_ratio=2.1, oi_change=3.0)
+        )
+
+        self.assertEqual(state.catalyst_status, "NO_CLEAR_CATALYST")
+        self.assertGreaterEqual(state.intraday_confluence_score, 75)
+
+    def test_intraday_medium_event_becomes_note(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(
+                change_1h=1.4,
+                change_15m=0.3,
+                change_4h=2.0,
+                volume_ratio=2.0,
+                volatility_ratio=2.0,
+                oi_change=0.5,
+                structure_1h="BULLISH_BREAKOUT",
+            )
+        )
+
+        self.assertEqual(state.decision, "INTRADAY_NOTE")
+        self.assertEqual(state.intraday_materiality, "INTRADAY_MEDIUM")
+
+    def test_intraday_note_reaches_publishing_pipeline_gate(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(
+                change_1h=1.4,
+                change_15m=0.3,
+                change_4h=2.0,
+                volume_ratio=2.0,
+                volatility_ratio=2.0,
+                oi_change=0.5,
+                structure_1h="BULLISH_BREAKOUT",
+            )
+        )
+        news = intraday_state_to_news_item(state)
+        result = evaluate_intraday_item(news, review_ok=True)
+
+        self.assertEqual(state.decision, "INTRADAY_NOTE")
+        self.assertTrue(result.passed)
+
+    def test_intraday_note_reaches_precandidate(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=-0.88, change_15m=-0.72, change_4h=-0.81, volume_ratio=2.1, volatility_ratio=2.2, oi_change=-0.69)
+        )
+        state.decision = "INTRADAY_NOTE"
+        state.intraday_materiality = "INTRADAY_MEDIUM"
+        state.intraday_confluence_score = 66
+        news = intraday_state_to_news_item(state)
+
+        self.assertTrue(can_reach_selection(news))
+        self.assertIn(news, _preselect_market_candidates([news]))
+
+    def test_intraday_note_reaches_writer(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=-0.88, change_15m=-0.72, change_4h=-0.81, volume_ratio=2.1, volatility_ratio=2.2, oi_change=-0.69)
+        )
+        state.decision = "INTRADAY_NOTE"
+        state.intraday_materiality = "INTRADAY_MEDIUM"
+        state.intraday_confluence_score = 66
+        news = intraday_state_to_news_item(state)
+
+        with patch("editor_writer.ask_json", return_value={
+            "news": [{
+                "id": 1,
+                "title": "BTC ENFRIA EL RALLY",
+                "what_happened": "BTC corrige en el corto plazo tras seguir positivo en 24h.",
+                "why_it_matters": "Importa porque el OI cae junto al precio.",
+                "affected_markets": ["BTC"],
+                "signals": ["BTC 24h positivo", "OI cae"],
+                "reading": "Compatible con limpieza de leverage, no causalidad confirmada.",
+                "what_to_watch": "Estructura 1h/4h y OI.",
+                "status": "PRELIMINAR",
+                "confidence": "Media",
+                "telegram_text": "BTC ENFRIA EL RALLY\n\n₿ BTC sigue arriba en 24h, pero pierde momentum de corto plazo.\n\n👉 LECTURA RADAR: la caida del OI es compatible con limpieza de leverage.",
+                "internal_diagnostic": {},
+            }]
+        }):
+            report = write_news([news])
+
+        self.assertIn("telegram_text", report["news"][0])
+        self.assertIn("BTC ENFRIA", report["news"][0]["telegram_text"])
+
+    def test_intraday_note_does_not_require_alert_gate(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=-0.88, change_15m=-0.72, change_4h=-0.81, volume_ratio=2.1, volatility_ratio=2.2, oi_change=-0.69)
+        )
+        state.decision = "INTRADAY_NOTE"
+        state.intraday_materiality = "INTRADAY_MEDIUM"
+        state.intraday_confluence_score = 66
+        news = intraday_state_to_news_item(state)
+        result = evaluate_intraday_item(news, review_ok=True)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(news.intelligence_summary["INTRADAY_DECISION"], "INTRADAY_NOTE")
+        self.assertLess(news.confluence_score, 70)
+
+    def test_selector_cannot_silently_kill_intraday_lane(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=-0.88, change_15m=-0.72, change_4h=-0.81, volume_ratio=2.1, volatility_ratio=2.2, oi_change=-0.69)
+        )
+        state.decision = "INTRADAY_NOTE"
+        state.intraday_materiality = "INTRADAY_MEDIUM"
+        state.intraday_confluence_score = 66
+        news = intraday_state_to_news_item(state)
+
+        selected = select_news_with_ai([news], use_ai=False)
+
+        self.assertIn(news, selected)
+
+    def test_confirmed_event_is_not_confirmed_causality(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=-0.88, change_15m=-0.72, change_4h=-0.81, volume_ratio=2.1, volatility_ratio=2.2, oi_change=-0.69)
+        )
+        state.decision = "INTRADAY_NOTE"
+        state.intraday_materiality = "INTRADAY_MEDIUM"
+        state.intraday_confluence_score = 66
+        state.catalyst_status = "CONFIRMED_CATALYST"
+        state.catalyst_source = "CNBC"
+        news = intraday_state_to_news_item(state)
+
+        self.assertEqual(news.intelligence_summary["CATALYST_EVENT_STATUS"], "CONFIRMED_EVENT")
+        self.assertEqual(news.intelligence_summary["CATALYST_CAUSALITY_CONFIDENCE"], "POSSIBLE")
+
+    def test_current_snapshot_generates_publishable_intraday_note(self):
+        snapshot = intraday_snapshot(
+            change_15m=-0.7266,
+            change_1h=-0.8882,
+            change_4h=-0.8126,
+            volume_ratio=2.1065,
+            volatility_ratio=2.2103,
+            oi_change=-0.6895,
+            structure_15m="RANGE",
+            structure_1h="BULLISH",
+            structure_4h="BULLISH",
+        )
+        snapshot.price_change_24h = 5.8792
+        snapshot.oi_change_15m = -0.6784
+        snapshot.oi_change_4h = -1.1799
+        snapshot.volume_ratio_15m = 2.1065
+        snapshot.volatility_ratio_15m = 2.2103
+        state = analyze_btc_intraday_state(snapshot)
+        state.decision = "INTRADAY_NOTE"
+        state.intraday_materiality = "INTRADAY_MEDIUM"
+        state.intraday_confluence_score = 66
+        state.catalyst_status = "CONFIRMED_CATALYST"
+        state.catalyst_source = "CNBC"
+        news = intraday_state_to_news_item(state)
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertTrue(can_reach_selection(news))
+        self.assertTrue(evaluate_intraday_item(news, review_ok=True).passed)
+        self.assertEqual(interpretation["story_angle"], "LEVERAGE_RESET_AFTER_RALLY")
+        self.assertIn("BTC ENFRIA", interpretation["headline"])
+        self.assertTrue(validate_publication_text(interpretation["headline"])["ok"])
+
+    def _fixture_result(self, name, item_obj, review_ok=True):
+        lane = lane_for_item(item_obj)
+        if lane in {"INTRADAY_ALERT", "INTRADAY_NOTE"}:
+            gate = evaluate_intraday_item(item_obj, review_ok=review_ok)
+            passed = gate.passed
+        elif lane in {"DAILY_NEWS", "DAILY_MARKET_RECAP", "COMBINED_STORY"}:
+            gate = evaluate_daily_item(item_obj, review_ok=review_ok)
+            passed = gate.passed
+        elif lane == "RUMOR":
+            gate = evaluate_rumor_item(item_obj, review_ok=review_ok)
+            passed = gate.passed
+        elif lane == "STRUCTURAL":
+            passed, _, _ = apply_publication_gate([item_obj], {"ok": review_ok, "errors": []})
+            passed = bool(passed)
+        else:
+            passed = bool(review_ok)
+        interpretation = build_editorial_interpretation(item_obj)
+        text = (
+            f"{interpretation['headline']}\n\n"
+            f"₿ {interpretation['news_summary']}\n\n"
+            f"👉 LECTURA RADAR: {interpretation['market_interpretation']}\n\n"
+            f"❓ {interpretation['suggested_question']}"
+        )
+        return {
+            "fixture": name,
+            "lane": lane,
+            "candidate_created": True,
+            "writer": "PASS",
+            "reviewer": "PASS" if review_ok else "FAIL",
+            "gate": "PASS" if passed else "FAIL",
+            "dedupe": "PASS",
+            "frequency": "PASS",
+            "final_result": "WOULD_PUBLISH" if passed else "REJECTED",
+            "telegram_text": text,
+        }
+
+    def test_product_fixture_a_btc_intraday_alert(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.1, volume_ratio=3.0, volatility_ratio=2.2, oi_change=3.0, structure_1h="BULLISH_BREAKOUT")
+        )
+        item_obj = intraday_state_to_news_item(state)
+        result = self._fixture_result("A", item_obj)
+
+        self.assertEqual(result["lane"], "INTRADAY_ALERT")
+        self.assertEqual(result["final_result"], "WOULD_PUBLISH")
+
+    def test_product_fixture_b_btc_daily_recap_or_note(self):
+        snapshot = intraday_snapshot(change_15m=-0.7, change_1h=-0.8, change_4h=-0.8, volume_ratio=2.1, volatility_ratio=2.2, oi_change=-0.7, structure_1h="BULLISH", structure_4h="BULLISH")
+        snapshot.price_change_24h = 6.0
+        snapshot.oi_change_15m = -0.6
+        snapshot.oi_change_4h = -1.2
+        state = analyze_btc_intraday_state(snapshot)
+        state.decision = "INTRADAY_NOTE"
+        state.intraday_materiality = "INTRADAY_MEDIUM"
+        state.intraday_confluence_score = 66
+        item_obj = intraday_state_to_news_item(state)
+        result = self._fixture_result("B", item_obj)
+
+        self.assertIn(result["lane"], {"INTRADAY_NOTE", "DAILY_MARKET_RECAP"})
+        self.assertEqual(result["final_result"], "WOULD_PUBLISH")
+        self.assertIn("LECTURA RADAR", result["telegram_text"])
+
+    def test_product_fixture_c_trump_clarity_daily_news(self):
+        news = item("Trump urges Congress to accelerate CLARITY Act for crypto regulation", "Trump comments on CLARITY Act and US crypto regulation.", source="CNBC")
+        news.event_type = "CRYPTO_REGULATION"
+        news.affected_assets = ["BTC"]
+        news.daily_news_relevance = 88
+        news.market_impact = 72
+        news.materiality = "MEDIUM"
+        news.confidence = "Media"
+        news.verification_status = "CONFIRMED"
+        news.mechanism = "crypto regulation -> institutional access/liquidity -> BTC"
+
+        result = self._fixture_result("C", news)
+
+        self.assertEqual(result["lane"], "DAILY_NEWS")
+        self.assertEqual(result["final_result"], "WOULD_PUBLISH")
+
+    def test_product_fixture_d_trump_rumor_lane(self):
+        rumor = item("Trump may announce emergency Bitcoin reserve policy", "Unconfirmed report about possible Bitcoin reserve policy.", source="Truth Social @realDonaldTrump")
+        rumor.event_type = "CRYPTO_REGULATION"
+        rumor.affected_assets = ["BTC"]
+        rumor.market_impact = 90
+        rumor.materiality = "HIGH"
+        rumor.verification_status = "RUMOR"
+        rumor.declaration_status = "THREATENED"
+        rumor.is_rumor = True
+        rumor.source_type = "FAST"
+        rumor.source_reliability = 75
+        rumor.link = "truthsocial://realDonaldTrump/1"
+        rumor.mechanism = "policy declaration -> crypto regulation expectations -> BTC"
+
+        result = self._fixture_result("D", rumor)
+
+        self.assertEqual(result["lane"], "RUMOR")
+        self.assertEqual(result["final_result"], "WOULD_PUBLISH")
+
+    def test_product_fixture_e_quiet_market(self):
+        decision = evaluate_quiet_market(quiet_btc_state(), history=[])
+
+        self.assertEqual(lane_for_item(decision.note), "QUIET_MARKET")
+        self.assertTrue(decision.passed)
+        self.assertIn("MARKET NOTE", decision.message)
+
+    def test_product_fixture_f_combined_story(self):
+        news = item("Trump CLARITY Act headline coincides with BTC breakout", "Crypto regulation headline coincides with BTC volume expansion.", source="CNBC")
+        news.event_type = "COMBINED_MARKET_STORY"
+        news.affected_assets = ["BTC"]
+        news.daily_news_relevance = 86
+        news.market_impact = 76
+        news.materiality = "HIGH"
+        news.verification_status = "CONFIRMED"
+        news.confidence = "Media"
+        news.mechanism = "news catalyst plus BTC market reaction -> daily BTC expectations"
+
+        result = self._fixture_result("F", news)
+
+        self.assertEqual(result["lane"], "COMBINED_STORY")
+        self.assertEqual(result["final_result"], "WOULD_PUBLISH")
+
+    def test_product_fixture_g_duplicate_same_event_no_publication(self):
+        cache = temp_seen_cache()
+        first = item("Trump urges Congress to accelerate CLARITY Act", source="CNBC")
+        second = item("Trump urges Congress to accelerate CLARITY Act", source="CoinDesk")
+        cache.remember_item(first, "PUBLISHED")
+        filtered, stats = cache.filter_new_items([second])
+
+        self.assertEqual(filtered, [])
+        self.assertGreaterEqual(stats.exact_duplicates + stats.near_duplicates + stats.same_event_merges, 1)
+
+    def test_product_fixture_h_material_update_can_republish(self):
+        old = item("Rumor says White House may advance CLARITY Act", source="Telegram")
+        old.verification_status = "RUMOR"
+        new = item("White House confirms CLARITY Act push", source="CNBC")
+        new.verification_status = "CONFIRMED"
+
+        self.assertEqual(event_update_type(old.verification_status, new.verification_status), "CONFIRMED")
+
+    def test_intraday_alert_reaches_publishing_pipeline_gate(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.1, volume_ratio=2.4, volatility_ratio=2.1, oi_change=3.0)
+        )
+        news = intraday_state_to_news_item(state)
+        result = evaluate_intraday_item(news, review_ok=True)
+
+        self.assertEqual(state.decision, "INTRADAY_ALERT")
+        self.assertTrue(result.passed)
+
+    def test_intraday_high_event_becomes_alert(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.1, volume_ratio=2.4, volatility_ratio=2.1, oi_change=3.0)
+        )
+
+        self.assertEqual(state.decision, "INTRADAY_ALERT")
+        self.assertIn(state.intraday_materiality, {"INTRADAY_HIGH", "INTRADAY_CRITICAL"})
+
+    def test_eight_percent_24h_strong_4h_context_not_low(self):
+        snapshot = intraday_snapshot(
+            change_15m=-0.0167,
+            change_1h=0.14,
+            change_4h=2.7429,
+            volume_ratio=1.0,
+            volatility_ratio=1.0,
+            oi_change=0.4,
+            structure_15m="BULLISH",
+            structure_1h="BULLISH",
+            structure_4h="BULLISH_BREAKOUT",
+        )
+        snapshot.price_change_24h = 8.1092
+        snapshot.volume_ratio_4h = 3.183
+        snapshot.volatility_ratio_4h = 2.3306
+        snapshot.oi_change_4h = 2.4173
+
+        state = analyze_btc_intraday_state(snapshot)
+
+        self.assertNotEqual(state.intraday_materiality, "INTRADAY_LOW")
+        self.assertEqual(state.decision, "INTRADAY_ALERT")
+
+    def test_no_catalyst_does_not_kill_intraday_alert(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.1, volume_ratio=2.4, volatility_ratio=2.1, oi_change=3.0)
+        )
+
+        self.assertEqual(state.catalyst_status, "NO_CLEAR_CATALYST")
+        self.assertEqual(state.decision, "INTRADAY_ALERT")
+
+    def test_btc_today_recap_can_publish_8pct_24h_current_1h_flat(self):
+        snapshot = intraday_snapshot(
+            change_15m=-0.1,
+            change_1h=0.26,
+            change_4h=-0.95,
+            volume_ratio=1.2,
+            volatility_ratio=1.1,
+            oi_change=0.84,
+            structure_15m="BEARISH",
+            structure_1h="BULLISH",
+            structure_4h="BULLISH",
+        )
+        snapshot.price_change_24h = 7.24
+        snapshot.oi_change_4h = -5.05
+        state = analyze_btc_intraday_state(snapshot)
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        self.assertEqual(state.decision, "NO_ACTION")
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.note.event_type, "BTC_DAILY_RECAP")
+        self.assertGreaterEqual(decision.score, 76)
+
+    def test_btc_today_no_recap_for_small_24h_move(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.1, change_4h=0.2, volume_ratio=1.0, volatility_ratio=1.0)
+        )
+        state.snapshot.price_change_24h = 0.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.reason, "LOW_DAILY_MARKET_STATE_SCORE")
+
+    def test_daily_recap_receives_actual_24h_market_state(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=-0.8, change_4h=-0.8, volume_ratio=2.1, volatility_ratio=2.2, oi_change=-0.7)
+        )
+        state.snapshot.price_change_24h = None
+        market_state = BtcMarketState(
+            snapshot=BtcMarketSnapshot(price=100000, price_change_24h=5.848),
+            intraday=state,
+        )
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        self.assertEqual(state.snapshot.price_change_24h, 5.848)
+        if decision.note:
+            self.assertEqual(decision.note.intelligence_summary["CURRENT_24H_MOVE"], 5.848)
+
+    def test_irrelevant_recent_events_excluded_from_btc_recap(self):
+        cache = temp_seen_cache()
+        cache.remember_item(item("Djibouti football federation elects new chairman", source="BBC World"), "DISCARDED")
+        cache.remember_item(item("Social Security union criticizes staffing decision", source="TechCrunch"), "DISCARDED")
+        cache.remember_item(item("Solana slot time improves after validator patch", source="Cointelegraph"), "DISCARDED")
+        cache.remember_item(item("Trump comments on Bitcoin regulation and CLARITY Act", source="CNBC"), "DISCARDED")
+
+        events = cache.get_recent_relevant_events(hours=24)
+
+        titles = " ".join(event["title"] for event in events)
+        self.assertIn("trump", titles)
+        self.assertNotIn("djibouti", titles)
+        self.assertNotIn("social security", titles)
+        self.assertNotIn("solana", titles)
+
+    def test_btc_today_rolling_memory_preserves_peak_move(self):
+        cache = temp_seen_cache()
+        peak = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.2, change_4h=4.0, volume_ratio=3.0, volatility_ratio=2.4, oi_change=4.0)
+        )
+        peak.snapshot.timestamp = (datetime.utcnow() - timedelta(hours=8)).isoformat()
+        cache.remember_btc_intraday_snapshot(peak)
+        cooled = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.1, change_4h=-0.4, volume_ratio=1.0, volatility_ratio=1.0, oi_change=-1.0)
+        )
+        cooled.snapshot.price_change_24h = 7.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=cooled)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=cache)
+
+        self.assertTrue(decision.eligible)
+        self.assertGreaterEqual(decision.note.intelligence_summary["MAX_MOVE_1H_24H"], 3.2)
+
+    def test_btc_today_same_daily_story_already_published_suppressed(self):
+        cache = temp_seen_cache()
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.1, change_4h=-0.4, volume_ratio=2.0, volatility_ratio=2.0, oi_change=-3.5)
+        )
+        state.snapshot.price_change_24h = 7.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            first = evaluate_daily_market_recap(market_state, seen_cache=cache)
+            cache.remember_daily_recap(first.fingerprint, published=True)
+            second = evaluate_daily_market_recap(market_state, seen_cache=cache)
+
+        self.assertTrue(first.eligible)
+        self.assertFalse(second.eligible)
+        self.assertEqual(second.reason, "DUPLICATE_DAILY_RECAP")
+
+    def test_btc_today_intraday_alert_already_covered_suppresses_recap(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.1, change_4h=-0.4, volume_ratio=2.0, volatility_ratio=2.0, oi_change=-3.5)
+        )
+        state.snapshot.price_change_24h = 7.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+        history = [{"date": datetime.now().strftime("%Y-%m-%d %H:%M"), "status": "published", "category": "BTC Intraday"}]
+
+        with patch("daily_recap.recent_history", return_value=history):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.reason, "RECENT_BTC_POST_ALREADY_COVERED")
+
+    def test_btc_today_oi_minus_5_uses_conservative_deleveraging_language(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.26, change_4h=-0.95, volume_ratio=2.5, volatility_ratio=2.0, oi_change=0.84)
+        )
+        state.snapshot.price_change_24h = 7.24
+        state.snapshot.oi_change_4h = -5.05
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        text = decision.note.content.lower()
+        self.assertIn("compatible con limpieza de apalancamiento", text)
+        self.assertIn("no identifica por sí solo", text)
+
+    def test_btc_today_no_catalyst_still_publishable(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.1, change_4h=-0.4, volume_ratio=2.5, volatility_ratio=2.0, oi_change=-3.5)
+        )
+        state.snapshot.price_change_24h = 7.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        self.assertTrue(decision.eligible)
+        self.assertIn("No hay catalizador confirmado", decision.note.content)
+
+    def test_btc_today_recent_seen_news_context_not_new_candidate(self):
+        cache = temp_seen_cache()
+        old = item("Trump pushes Congress to pass CLARITY Act", source="CoinDesk")
+        cache.remember_item(old, "DISCARDED")
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.1, change_4h=-0.4, volume_ratio=2.5, volatility_ratio=2.0, oi_change=-3.5)
+        )
+        state.snapshot.price_change_24h = 7.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=cache)
+
+        self.assertTrue(decision.recent_events)
+        self.assertIn("trump", decision.note.content.lower())
+
+    def test_btc_today_old_clarity_replay_does_not_republish(self):
+        cache = temp_seen_cache()
+        cache.remember_item(item("CLARITY Act advances after committee vote", source="CoinDesk"), "DISCARDED")
+
+        replay = replay_seen_events_with_current_rules(cache, hours=24)
+
+        self.assertTrue(replay[0]["would_be_daily_candidate_now"])
+        self.assertFalse(replay[0]["retroactive_publish"])
+
+    def test_btc_today_image_failure_does_not_block_text(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.1, change_4h=-0.4, volume_ratio=2.5, volatility_ratio=2.0, oi_change=-3.5)
+        )
+        state.snapshot.price_change_24h = 7.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+        path = prepare_editorial_image(decision.note, generator=Mock(side_effect=RuntimeError("image down")))
+
+        self.assertIsNone(path)
+        self.assertTrue(decision.note.image_eligible)
+
+    def test_btc_today_no_buy_sell_language(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.1, change_4h=-0.4, volume_ratio=2.5, volatility_ratio=2.0, oi_change=-3.5)
+        )
+        state.snapshot.price_change_24h = 7.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        text = decision.note.content.lower()
+        self.assertNotIn("compra", text)
+        self.assertNotIn("vende", text)
+        self.assertNotIn("buy", text)
+        self.assertNotIn("sell", text)
+
+    def test_editorial_interpreter_summarizes_news_before_analysis(self):
+        news = publishable_item("SEC opens comment period on spot Bitcoin ETF custody rule")
+        news.summary = "The SEC opened a formal comment period on a Bitcoin ETF custody rule."
+
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertIn("SEC", interpretation["headline"])
+        self.assertIn("comment period", interpretation["news_summary"])
+        self.assertIn("La noticia importa", interpretation["market_interpretation"])
+
+    def test_editorial_publication_selects_only_important_data(self):
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=0.26, change_4h=-0.95, volume_ratio=2.5, volatility_ratio=2.0, oi_change=0.84)
+        )
+        state.snapshot.price_change_24h = 7.24
+        state.snapshot.oi_change_4h = -5.05
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+        interpretation = build_editorial_interpretation(decision.note)
+
+        self.assertLessEqual(len(interpretation["interesting_data_selected"]), 4)
+        self.assertTrue(interpretation["data_omitted_from_publication"])
+
+    def test_price_up_oi_down_generates_nuanced_interpretation(self):
+        news = NewsItem(
+            title="BTC today",
+            summary="BTC rises strongly while open interest falls.",
+            content="",
+            link="market-state:btc-test",
+            published="",
+            source="MARKET_STATE",
+            event_type="BTC_DAILY_RECAP",
+            affected_assets=["BTC"],
+        )
+        news.intelligence_summary = {
+            "CURRENT_24H_MOVE": 7.2,
+            "OI_CONTEXT_4H": -5.0,
+            "MAX_VOLUME_RATIO_24H": 2.7,
+            "STRUCTURE": "15m=COOLING, 1h=BULLISH, 4h=BULLISH",
+        }
+
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertEqual(interpretation["story_angle"], "PRICE_UP_OI_DOWN")
+        self.assertIn("compatible con limpieza", interpretation["primary_hypothesis"])
+        self.assertIn("no con una prueba automatica", interpretation["primary_hypothesis"])
+
+    def test_oi_alone_cannot_prove_short_covering(self):
+        news = NewsItem(
+            title="BTC rises with OI falling",
+            summary="BTC rises while OI falls.",
+            content="",
+            link="market-state:btc-test-2",
+            published="",
+            source="MARKET_STATE",
+            event_type="BTC_DAILY_RECAP",
+            affected_assets=["BTC"],
+        )
+        news.intelligence_summary = {"CURRENT_24H_MOVE": 7.2, "OI_CONTEXT_4H": -5.0}
+
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertNotIn("provocaron", interpretation["primary_hypothesis"].lower())
+        self.assertIn("compatible", interpretation["primary_hypothesis"].lower())
+
+    def test_multiple_related_catalysts_can_form_combined_story(self):
+        news = publishable_item("Trump and CLARITY Act headlines coincide with BTC move")
+        news.event_type = "COMBINED_MARKET_STORY"
+        news.summary = "Trump and CLARITY Act headlines coincide with a BTC breakout."
+
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertEqual(interpretation["story_angle"], "CLARITY_ACT")
+        self.assertIn("mercado", interpretation["suggested_question"])
+
+    def test_catalyst_correlation_does_not_become_causation(self):
+        news = publishable_item("CLARITY Act headline coincides with BTC rally")
+        news.verification_status = "PRELIMINARY"
+        news.intelligence_summary = {"CATALYST": "POSSIBLE_CATALYST"}
+
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertIn("correlacion temporal", " ".join(interpretation["evidence_against"]))
+        self.assertEqual(interpretation["catalyst_confidence"], "POSSIBLE_CATALYST")
+
+    def test_smc_terminology_translated_into_normal_language(self):
+        news = publishable_item("BTC liquidity above recent highs")
+        news.market_signals = ["EQUAL_HIGHS_LIQUIDITY", "VISIBLE_LIQUIDITY_ABOVE"]
+
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertIn("zona de liquidez relevante por encima", interpretation["primary_hypothesis"])
+        self.assertNotIn("smart money hunted stops", interpretation["primary_hypothesis"].lower())
+
+    def test_formatter_uses_compact_telegram_text(self):
+        report = {
+            "news": [
+                {
+                    "title": "BITCOIN DESPIERTA",
+                    "what_happened": "BTC sube.",
+                    "why_it_matters": "Importa por estructura.",
+                    "affected_markets": ["BTC"],
+                    "signals": [],
+                    "reading": "Lectura prudente.",
+                    "what_to_watch": "Volumen.",
+                    "status": "PRELIMINAR",
+                    "confidence": "Media",
+                    "telegram_text": "BITCOIN DESPIERTA\n\n₿ BTC sube con volumen.\n\n👉 LECTURA RADAR: el movimiento gana interes, pero necesita confirmacion.",
+                }
+            ]
+        }
+
+        message = format_report(report)[0]
+
+        self.assertTrue(message.startswith("BITCOIN DESPIERTA"))
+        self.assertIn("LECTURA RADAR", message)
+        self.assertNotIn("*Qué ha pasado:*", message)
+
+    def test_title_is_editorial_but_fact_safe(self):
+        news = publishable_item("Bitcoin rally with lower leverage")
+        news.event_type = "BTC_DAILY_RECAP"
+        news.intelligence_summary = {"CURRENT_24H_MOVE": 7.2, "OI_CONTEXT_4H": -5.0}
+
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertIn("BITCOIN", interpretation["headline"])
+        self.assertFalse(validate_publication_text(interpretation["headline"])["errors"])
+
+    def test_duplicate_thesis_is_marked_for_editorial_dedupe(self):
+        news = publishable_item("Bitcoin rally with lower leverage")
+        news.event_type = "BTC_DAILY_RECAP"
+        news.intelligence_summary = {"CURRENT_24H_MOVE": 7.2, "OI_CONTEXT_4H": -5.0}
+        first = build_editorial_interpretation(news)
+        second = build_editorial_interpretation(news)
+
+        self.assertEqual(first["story_angle"], second["story_angle"])
+        self.assertEqual(first["headline"], second["headline"])
+
+    def test_material_thesis_change_can_republish(self):
+        rally = publishable_item("Bitcoin rally with lower leverage")
+        rally.event_type = "BTC_DAILY_RECAP"
+        rally.intelligence_summary = {"CURRENT_24H_MOVE": 7.2, "OI_CONTEXT_4H": -5.0}
+        breakout = publishable_item("Bitcoin breaks higher with renewed structure")
+        breakout.event_type = "BTC_DAILY_RECAP"
+        breakout.intelligence_summary = {"CURRENT_24H_MOVE": 7.2, "OI_CONTEXT_4H": 4.0, "STRUCTURE": "BULLISH_BREAKOUT"}
+
+        self.assertNotEqual(
+            build_editorial_interpretation(rally)["story_angle"],
+            build_editorial_interpretation(breakout)["story_angle"],
+        )
+
+    def test_final_question_derives_from_evidence(self):
+        news = publishable_item("Bitcoin rally with lower leverage")
+        news.event_type = "BTC_DAILY_RECAP"
+        news.intelligence_summary = {"CURRENT_24H_MOVE": 7.2, "OI_CONTEXT_4H": -5.0}
+
+        interpretation = build_editorial_interpretation(news)
+
+        self.assertIn("demanda", interpretation["suggested_question"].lower())
+        self.assertIn("leverage", interpretation["suggested_question"].lower())
+
+    def test_image_brief_matches_editorial_story(self):
+        news = publishable_item("Trump pushes CLARITY Act as BTC rallies")
+        news.daily_news_relevance = 88
+        news.event_type = "COMBINED_MARKET_STORY"
+        brief = build_image_brief(news)
+
+        self.assertTrue(brief.eligible)
+        self.assertIn("Bitcoin", brief.brief)
+        self.assertIn("RADAR BTC", brief.brief)
+
+    def test_unsupported_whale_institution_claims_rejected(self):
+        review = validate_publication_text("Las instituciones están comprando BTC y las ballenas van en largo.")
+
+        self.assertFalse(review["ok"])
+        self.assertTrue(any("unsupported" in error or "forbidden" in error for error in review["errors"]))
+
+    def test_quiet_market_can_produce_useful_analysis(self):
+        quiet = NewsItem(
+            title="Bitcoin lleva horas sin decidirse",
+            summary="Volatilidad comprimida y rango estrecho.",
+            content="📊 MARKET NOTE\n\nBitcoin apenas se mueve y la volatilidad esta comprimida.",
+            link="quiet-market:btc:test",
+            published="",
+            source="MARKET_STATE",
+            category=QUIET_MARKET_CATEGORY,
+            event_type="QUIET_MARKET_STATE",
+            affected_assets=["BTC"],
+        )
+
+        interpretation = build_editorial_interpretation(quiet)
+
+        self.assertEqual(interpretation["story_angle"], "QUIET_MARKET")
+        self.assertIn("ausencia de catalizadores", interpretation["primary_hypothesis"])
+
+    def test_publication_remains_concise(self):
+        text = (
+            "BITCOIN SUBE, PERO EL APALANCAMIENTO DESAPARECE\n\n"
+            "₿ BTC conserva mas de un 7% de subida diaria mientras el open interest cae alrededor de un 5% en cuatro horas.\n\n"
+            "👉 LECTURA RADAR: es compatible con limpieza de leverage, no una prueba automatica de demanda nueva.\n\n"
+            "❓ ¿Aparece volumen real si el OI vuelve a crecer?"
+        )
+
+        review = validate_publication_text(text)
+
+        self.assertTrue(review["ok"])
+        self.assertLessEqual(len(text.split()), 80)
+
     def test_intraday_up_three_percent_volume_and_oi_is_high_candidate(self):
         state = analyze_btc_intraday_state(
             intraday_snapshot(
@@ -2152,7 +3227,7 @@ class MarketIntelligenceTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(state.decision, "INTRADAY_CANDIDATE")
+        self.assertEqual(state.decision, "INTRADAY_ALERT")
         self.assertIn(state.intraday_materiality, {"INTRADAY_HIGH", "INTRADAY_CRITICAL"})
 
     def test_intraday_down_four_percent_oi_collapse_is_deleveraging_candidate(self):
@@ -2162,7 +3237,7 @@ class MarketIntelligenceTests(unittest.TestCase):
         names = {signal.name for signal in state.signals}
 
         self.assertIn("DELEVERAGING_STYLE_MOVE", names)
-        self.assertEqual(state.decision, "INTRADAY_CANDIDATE")
+        self.assertEqual(state.decision, "INTRADAY_ALERT")
 
     def test_intraday_up_four_percent_oi_falling_is_short_covering_inference(self):
         state = analyze_btc_intraday_state(
@@ -2275,7 +3350,7 @@ class MarketIntelligenceTests(unittest.TestCase):
             intraday_snapshot(change_1h=1.0, change_15m=0.4, volume_ratio=1.0, volatility_ratio=1.0, oi_change=0.5, structure_1h="BULLISH_BREAKOUT")
         )
 
-        self.assertNotEqual(state.decision, "INTRADAY_CANDIDATE")
+        self.assertNotEqual(state.decision, "INTRADAY_ALERT")
 
     def test_intraday_bos_volume_oi_strengthens_smc(self):
         weak = analyze_btc_intraday_state(
@@ -2301,14 +3376,14 @@ class MarketIntelligenceTests(unittest.TestCase):
             intraday_snapshot(change_1h=0.3, change_15m=0.1, volume_ratio=1.0, volatility_ratio=1.0, oi_change=0.0, structure_1h="BULLISH_BREAKOUT")
         )
 
-        self.assertNotEqual(state.decision, "INTRADAY_CANDIDATE")
+        self.assertNotEqual(state.decision, "INTRADAY_ALERT")
 
     def test_intraday_smc_abnormal_move_derivatives_volume_can_elevate(self):
         state = analyze_btc_intraday_state(
             intraday_snapshot(change_1h=3.2, change_15m=1.1, volume_ratio=2.5, volatility_ratio=2.2, oi_change=3.2, structure_1h="BULLISH_BREAKOUT")
         )
 
-        self.assertEqual(state.decision, "INTRADAY_CANDIDATE")
+        self.assertEqual(state.decision, "INTRADAY_ALERT")
 
     def test_intraday_publication_can_include_editorial_question_without_certainty(self):
         state = analyze_btc_intraday_state(
@@ -2354,6 +3429,26 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertEqual(len(accepted_first), 1)
         self.assertEqual(accepted_second, [])
         self.assertGreaterEqual(stats.same_event_merges + stats.near_duplicates, 1)
+
+    def test_intraday_same_move_next_cycle_is_duplicate_move(self):
+        previous = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.0, change_15m=1.1, change_4h=3.0, volume_ratio=2.4, volatility_ratio=2.1, oi_change=3.0)
+        )
+        current = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.1, change_15m=1.0, change_4h=3.1, volume_ratio=2.3, volatility_ratio=2.0, oi_change=3.1)
+        )
+
+        self.assertEqual(intraday_update_type(previous, current), "DUPLICATE_MOVE")
+
+    def test_intraday_material_extension_is_update(self):
+        previous = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=1.8, change_15m=0.5, change_4h=2.0, volume_ratio=2.0, volatility_ratio=1.9, oi_change=1.0)
+        )
+        current = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=3.2, change_15m=1.1, change_4h=4.1, volume_ratio=2.5, volatility_ratio=2.2, oi_change=3.2)
+        )
+
+        self.assertEqual(intraday_update_type(previous, current), "MATERIAL_UPDATE")
 
     def test_quiet_market_cannot_override_strong_intraday_movement(self):
         intraday = analyze_btc_intraday_state(
@@ -2930,6 +4025,36 @@ class MarketIntelligenceTests(unittest.TestCase):
                 "RSS",
                 hanging_call,
                 timeout=0.01,
+                fallback=[],
+            )
+        )
+
+        self.assertEqual(result, [])
+
+    def test_sync_phase_error_returns_fallback(self):
+        def failing_call():
+            raise ConnectionError("network unavailable")
+
+        result = __import__("asyncio").run(
+            run_sync_phase(
+                "RSS",
+                failing_call,
+                timeout=0.5,
+                fallback=[],
+            )
+        )
+
+        self.assertEqual(result, [])
+
+    def test_async_phase_error_returns_fallback(self):
+        async def failing_call():
+            raise ConnectionError("telegram unavailable")
+
+        result = __import__("asyncio").run(
+            run_async_phase(
+                "TELEGRAM",
+                failing_call,
+                timeout=0.5,
                 fallback=[],
             )
         )

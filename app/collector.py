@@ -6,6 +6,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from config import ARTICLE_TIMEOUT_SECONDS, RSS_TIMEOUT_SECONDS
+from editorial_lanes import needs_article_download
 from feeds_fixed import RSS_FEEDS
 from models import NewsItem
 from sources_registry import apply_source_metadata
@@ -190,6 +191,12 @@ def enrich_news(news, diagnostics=None):
     enriched = []
 
     for item in news:
+
+        if not needs_article_download(item):
+            if not item.content:
+                item.content = item.summary
+            enriched.append(item)
+            continue
 
         content = extract_content(item.link, diagnostics=diagnostics)
 

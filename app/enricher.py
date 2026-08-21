@@ -1,17 +1,23 @@
 from pathlib import Path
 
 from ai import ask_json
+from editorial_lanes import needs_ai_enrichment
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "market_enricher.md"
 
 
 def enrich_metadata(news):
+    passthrough = [item for item in news if not needs_ai_enrichment(item)]
+    enrichable = [item for item in news if needs_ai_enrichment(item)]
+
+    if not enrichable:
+        return news
 
     rules = PROMPT_PATH.read_text(encoding="utf-8")
 
     dossier = []
 
-    for i, item in enumerate(news, start=1):
+    for i, item in enumerate(enrichable, start=1):
 
         dossier.append(
             f"""
@@ -92,7 +98,7 @@ Devuelve exactamente este JSON:
 
     for result in data["news"]:
 
-        item = news[result["id"] - 1]
+        item = enrichable[result["id"] - 1]
 
         item.score = result.get("score", item.score)
         item.market_impact = result.get("market_impact", item.market_impact or item.score)
@@ -112,4 +118,4 @@ Devuelve exactamente este JSON:
         item.actual = result.get("actual", item.actual)
         item.surprise = result.get("surprise", item.surprise)
 
-    return news
+    return passthrough + enrichable

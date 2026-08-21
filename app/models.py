@@ -26,6 +26,14 @@ class NewsItem:
     affected_assets: list[str] = field(default_factory=list)
     asset_class: str = "UNKNOWN"
     market_impact: int = 0
+    structural_news_relevance: int = 0
+    daily_news_relevance: int = 0
+    intraday_news_relevance: int = 0
+    rumor_relevance: int = 0
+    accepted_by: list[str] = field(default_factory=list)
+    image_eligible: bool = False
+    image_brief: str = ""
+    image_path: str = ""
     impact_horizon: str = "UNKNOWN"
     source_type: str = "BACKGROUND"
     source_reliability: int = 40

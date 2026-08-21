@@ -1,5 +1,6 @@
 import re
 import sqlite3
+import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -291,6 +292,34 @@ class SeenCache:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS btc_daily_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    price REAL,
+                    price_change_15m REAL,
+                    price_change_1h REAL,
+                    price_change_4h REAL,
+                    price_change_24h REAL,
+                    volume_ratio_1h REAL,
+                    volume_ratio_4h REAL,
+                    volatility_ratio_1h REAL,
+                    volatility_ratio_4h REAL,
+                    oi_change_1h REAL,
+                    oi_change_4h REAL,
+                    funding_rate REAL,
+                    structure_15m TEXT,
+                    structure_1h TEXT,
+                    structure_4h TEXT,
+                    intraday_decision TEXT,
+                    intraday_materiality TEXT,
+                    confluence_score INTEGER,
+                    signals TEXT
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_btc_daily_memory_time ON btc_daily_memory(timestamp)")
 
     def _ensure_column(self, conn, table, column, definition):
         columns = {
@@ -633,6 +662,172 @@ class SeenCache:
                 """
                 INSERT INTO market_state(kind, fingerprint, last_seen, last_published)
                 VALUES ('quiet_market', ?, ?, ?)
+                ON CONFLICT(kind) DO UPDATE SET
+                    fingerprint=excluded.fingerprint,
+                    last_seen=excluded.last_seen,
+                    last_published=excluded.last_published
+                """,
+                (fingerprint, now, last_published),
+            )
+
+    def remember_btc_intraday_snapshot(self, state):
+        if state is None or getattr(state, "snapshot", None) is None:
+            return
+        snapshot = state.snapshot
+        timestamp = snapshot.timestamp or _utc_now()
+        signals = [signal.name for signal in getattr(state, "signals", [])]
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO btc_daily_memory(
+                    timestamp, price, price_change_15m, price_change_1h,
+                    price_change_4h, price_change_24h, volume_ratio_1h,
+                    volume_ratio_4h, volatility_ratio_1h, volatility_ratio_4h,
+                    oi_change_1h, oi_change_4h, funding_rate, structure_15m,
+                    structure_1h, structure_4h, intraday_decision,
+                    intraday_materiality, confluence_score, signals
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    snapshot.price,
+                    snapshot.price_change_15m,
+                    snapshot.price_change_1h,
+                    snapshot.price_change_4h,
+                    snapshot.price_change_24h,
+                    snapshot.volume_ratio_1h,
+                    snapshot.volume_ratio_4h,
+                    snapshot.volatility_ratio_1h,
+                    snapshot.volatility_ratio_4h,
+                    snapshot.oi_change_1h,
+                    snapshot.oi_change_4h,
+                    snapshot.funding_rate,
+                    snapshot.structure_15m,
+                    snapshot.structure_1h,
+                    snapshot.structure_4h,
+                    state.decision,
+                    state.intraday_materiality,
+                    state.intraday_confluence_score,
+                    json.dumps(signals),
+                ),
+            )
+
+    def btc_daily_memory(self, hours=24):
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM btc_daily_memory
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+                """,
+                (cutoff.isoformat(timespec="seconds"),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_relevant_events(self, hours=24, limit=12):
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        patterns = [
+            r"\bbitcoin\b",
+            r"\bbtc\b",
+            r"\bclarity\b",
+            r"\bcrypto\b.*\bregulation\b",
+            r"\bcripto\b.*\bregul",
+            r"\bstablecoin",
+            r"\btrump\b.*\b(bitcoin|btc|crypto|cripto|clarity|tariff|arancel|fed|rate|treasury|sec|cftc|oil|china|sanction)",
+            r"\b(bitcoin|btc|crypto|cripto|clarity|tariff|arancel|fed|rate|treasury|sec|cftc|oil|china|sanction)\b.*\btrump\b",
+            r"\bwhite house\b.*\b(bitcoin|btc|crypto|cripto|tariff|arancel|fed|rate|treasury|sec|cftc|oil|china|sanction)",
+            r"\b(bitcoin|btc|crypto|cripto|tariff|arancel|fed|rate|treasury|sec|cftc|oil|china|sanction)\b.*\bwhite house\b",
+            r"\bsec\b",
+            r"\bcftc\b",
+            r"\betf\b",
+            r"\bfed\b",
+            r"\bfederal reserve\b",
+            r"\btreasury\b",
+            r"\bliquidity\b",
+            r"\bliquidez\b",
+            r"\brate\b",
+            r"\byield",
+            r"\bdollar\b",
+            r"\busd\b",
+            r"\bexchange\b",
+            r"\bbinance\b",
+            r"\bcoinbase\b",
+            r"\bwar\b.*\boil\b",
+            r"\boil\b.*\bshock\b",
+        ]
+        exclusions = [
+            r"\bfootball\b",
+            r"\bsoccer\b",
+            r"\bfederation\b",
+            r"\bsocial security\b",
+            r"\bground beef\b",
+            r"\bcar race\b",
+            r"\bballroom\b",
+            r"\bsolana\b",
+            r"\bnft\b",
+            r"\bmemecoin\b",
+        ]
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT normalized_title, source, published, event_fingerprint, event_state, status, last_seen
+                FROM seen_items
+                WHERE last_seen >= ?
+                ORDER BY last_seen DESC
+                LIMIT 200
+                """,
+                (cutoff.isoformat(timespec="seconds"),),
+            ).fetchall()
+        events = []
+        seen = set()
+        for row in rows:
+            normalized = row["normalized_title"] or ""
+            event_id = row["event_fingerprint"] or normalized
+            if event_id in seen:
+                continue
+            if any(re.search(pattern, normalized) for pattern in exclusions):
+                continue
+            if not any(re.search(pattern, normalized) for pattern in patterns):
+                continue
+            seen.add(event_id)
+            events.append(
+                {
+                    "title": normalized,
+                    "source": row["source"] or "",
+                    "event_type": row["event_fingerprint"] or "",
+                    "daily_relevance": "UNKNOWN",
+                    "intraday_relevance": "UNKNOWN",
+                    "verification": row["event_state"] or "UNKNOWN",
+                    "timestamp": row["published"] or row["last_seen"] or "",
+                    "status": row["status"] or "",
+                }
+            )
+            if len(events) >= limit:
+                break
+        return events
+
+    def daily_recap_seen(self, fingerprint):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM market_state WHERE kind = 'btc_daily_recap'",
+            ).fetchone()
+            if not row:
+                return False, None
+            return row["fingerprint"] == fingerprint, dict(row)
+
+    def remember_daily_recap(self, fingerprint, published=False):
+        now = _utc_now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM market_state WHERE kind = 'btc_daily_recap'",
+            ).fetchone()
+            last_published = now if published else (row["last_published"] if row else "")
+            conn.execute(
+                """
+                INSERT INTO market_state(kind, fingerprint, last_seen, last_published)
+                VALUES ('btc_daily_recap', ?, ?, ?)
                 ON CONFLICT(kind) DO UPDATE SET
                     fingerprint=excluded.fingerprint,
                     last_seen=excluded.last_seen,

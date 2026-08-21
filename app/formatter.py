@@ -1,4 +1,6 @@
 def format_one(news):
+    if news.get("telegram_text"):
+        return news["telegram_text"].strip()
 
     confidence = news.get("confidence", "").lower()
 
