@@ -50,18 +50,23 @@ class BtcIntradaySnapshot:
     price_change_1h: float | None = None
     price_change_4h: float | None = None
     price_change_24h: float | None = None
+    max_abs_move_15m_24h: float | None = None
+    max_abs_move_1h_24h: float | None = None
+    max_abs_move_4h_24h: float | None = None
     volume_15m: float | None = None
     volume_1h: float | None = None
     volume_4h: float | None = None
     volume_ratio_15m: float | None = None
     volume_ratio_1h: float | None = None
     volume_ratio_4h: float | None = None
+    peak_volume_ratio_24h: float | None = None
     realized_volatility_15m: float | None = None
     realized_volatility_1h: float | None = None
     realized_volatility_4h: float | None = None
     volatility_ratio_15m: float | None = None
     volatility_ratio_1h: float | None = None
     volatility_ratio_4h: float | None = None
+    peak_volatility_ratio_24h: float | None = None
     open_interest: float | None = None
     oi_change_15m: float | None = None
     oi_change_1h: float | None = None
@@ -201,6 +206,53 @@ def _volatility_ratio(candles, bars):
     if current is None or baseline in {None, 0}:
         return None
     return current / baseline
+
+
+def _max_abs_change(candles, bars, lookback_bars):
+    if not candles or len(candles) <= bars:
+        return None
+    start = max(bars, len(candles) - lookback_bars)
+    moves = []
+    for idx in range(start, len(candles)):
+        change = _pct_change(candles[idx]["close"], candles[idx - bars]["close"])
+        if change is not None:
+            moves.append(abs(change))
+    return max(moves or [None])
+
+
+def _peak_volume_ratio(candles, bars, lookback_bars):
+    if not candles or len(candles) < bars * 4:
+        return None
+    values = [candle["volume"] for candle in candles]
+    ratios = []
+    start = max(bars * 4, len(candles) - lookback_bars)
+    for end in range(start, len(candles) + 1):
+        current = sum(values[end - bars : end])
+        prior = values[: end - bars]
+        baseline = _mean(_window_sums(prior, bars)[-12:])
+        if baseline not in {None, 0}:
+            ratios.append(current / baseline)
+    return max(ratios or [None])
+
+
+def _peak_volatility_ratio(candles, bars, lookback_bars):
+    if not candles or len(candles) < bars * 4:
+        return None
+    ratios = []
+    start = max(bars * 4, len(candles) - lookback_bars)
+    for end in range(start, len(candles) + 1):
+        current_window = candles[end - bars : end]
+        current = _range_volatility(current_window, bars)
+        prior = candles[: end - bars]
+        windows = []
+        for idx in range(0, len(prior) - bars + 1, bars):
+            value = _range_volatility(prior[idx : idx + bars], bars)
+            if value is not None:
+                windows.append(value)
+        baseline = _mean(windows[-12:])
+        if current is not None and baseline not in {None, 0}:
+            ratios.append(current / baseline)
+    return max(ratios or [None])
 
 
 def _movement_baseline(candles, bars):
@@ -374,18 +426,45 @@ def fetch_btc_intraday_snapshot(client=None, liquidity_structure=None):
     snapshot.price_change_1h = _change_from_bars(candles_5m, 12)
     snapshot.price_change_4h = _change_from_bars(candles_5m, 48)
     snapshot.price_change_24h = _change_from_bars(candles_5m, 288 - 1)
+    snapshot.max_abs_move_15m_24h = _max_abs_change(candles_5m, 3, 288)
+    snapshot.max_abs_move_1h_24h = _max_abs_change(candles_5m, 12, 288)
+    snapshot.max_abs_move_4h_24h = _max_abs_change(candles_5m, 48, 288)
     snapshot.volume_15m = _volume_sum(candles_5m, 3)
     snapshot.volume_1h = _volume_sum(candles_5m, 12)
     snapshot.volume_4h = _volume_sum(candles_5m, 48)
     snapshot.volume_ratio_15m = _volume_ratio(candles_5m, 3)
     snapshot.volume_ratio_1h = _volume_ratio(candles_5m, 12)
     snapshot.volume_ratio_4h = _volume_ratio(candles_5m, 48)
+    snapshot.peak_volume_ratio_24h = max(
+        [
+            value
+            for value in [
+                _peak_volume_ratio(candles_5m, 3, 288),
+                _peak_volume_ratio(candles_5m, 12, 288),
+                _peak_volume_ratio(candles_5m, 48, 288),
+            ]
+            if value is not None
+        ]
+        or [None]
+    )
     snapshot.realized_volatility_15m = _range_volatility(candles_5m, 3)
     snapshot.realized_volatility_1h = _range_volatility(candles_5m, 12)
     snapshot.realized_volatility_4h = _range_volatility(candles_5m, 48)
     snapshot.volatility_ratio_15m = _volatility_ratio(candles_5m, 3)
     snapshot.volatility_ratio_1h = _volatility_ratio(candles_5m, 12)
     snapshot.volatility_ratio_4h = _volatility_ratio(candles_5m, 48)
+    snapshot.peak_volatility_ratio_24h = max(
+        [
+            value
+            for value in [
+                _peak_volatility_ratio(candles_5m, 3, 288),
+                _peak_volatility_ratio(candles_5m, 12, 288),
+                _peak_volatility_ratio(candles_5m, 48, 288),
+            ]
+            if value is not None
+        ]
+        or [None]
+    )
     snapshot.structure_15m = _structure(candles_15m)
     snapshot.structure_1h = _structure(candles_1h)
     snapshot.structure_4h = _structure(candles_4h)

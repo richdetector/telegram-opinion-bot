@@ -66,27 +66,28 @@ def print_funnel_summary(funnel, discard_counters):
     daily_recap = funnel.get("daily_recap")
     if daily_recap:
         note = daily_recap.note
+        context = getattr(daily_recap, "context", None)
+        summary = note.intelligence_summary if note and note.intelligence_summary else {}
         print("DAILY MARKET RECAP")
         print(f"Eligible: {daily_recap.eligible}")
-        if note:
-            summary = note.intelligence_summary or {}
-            print(f"24h move: {summary.get('CURRENT_24H_MOVE', 'UNKNOWN')}")
-            print(f"Max 1h move 24h: {summary.get('MAX_MOVE_1H_24H', 'UNKNOWN')}")
-            print(f"Max 4h move 24h: {summary.get('MAX_MOVE_4H_24H', 'UNKNOWN')}")
-            print(f"Peak volume: {summary.get('MAX_VOLUME_RATIO_24H', 'UNKNOWN')}")
-            print(f"OI context: {summary.get('OI_CONTEXT_4H', 'UNKNOWN')}")
-            print(f"Structure: {summary.get('STRUCTURE', 'UNKNOWN')}")
-        else:
-            print("24h move: UNKNOWN")
-            print("Max 1h move 24h: UNKNOWN")
-            print("Max 4h move 24h: UNKNOWN")
-            print("Peak volume: UNKNOWN")
-            print("OI context: UNKNOWN")
-            print("Structure: UNKNOWN")
+        print(f"24h move: {summary.get('CURRENT_24H_MOVE', getattr(context, 'change_24h', 'UNKNOWN'))}")
+        print(f"Max 15m move 24h: {summary.get('MAX_MOVE_15M_24H', getattr(context, 'max_abs_move_15m_24h', 'UNKNOWN'))}")
+        print(f"Max 1h move 24h: {summary.get('MAX_MOVE_1H_24H', getattr(context, 'max_abs_move_1h_24h', 'UNKNOWN'))}")
+        print(f"Max 4h move 24h: {summary.get('MAX_MOVE_4H_24H', getattr(context, 'max_abs_move_4h_24h', 'UNKNOWN'))}")
+        print(f"Peak volume: {summary.get('MAX_VOLUME_RATIO_24H', getattr(context, 'peak_volume_ratio_24h', 'UNKNOWN'))}")
+        print(f"Peak volatility: {summary.get('MAX_VOLATILITY_RATIO_24H', getattr(context, 'peak_volatility_ratio_24h', 'UNKNOWN'))}")
+        print(f"OI context: {summary.get('OI_DAILY_CONTEXT', getattr(context, 'oi_daily_context', 'UNKNOWN'))}")
+        print(f"OI 1h: {summary.get('OI_CONTEXT_1H', getattr(context, 'oi_change_1h', 'UNKNOWN'))}")
+        print(f"OI 4h: {summary.get('OI_CONTEXT_4H', getattr(context, 'oi_change_4h', 'UNKNOWN'))}")
+        print(f"Funding: {summary.get('FUNDING', getattr(context, 'funding', 'UNKNOWN'))}")
+        print(f"Structure: {summary.get('STRUCTURE', getattr(context, 'data_status', 'UNKNOWN'))}")
+        print(f"Liquidity: {summary.get('LIQUIDITY_CONTEXT', getattr(context, 'liquidity_context', 'UNKNOWN'))}")
+        print(f"Data status: {summary.get('DATA_STATUS', getattr(context, 'data_status', 'UNKNOWN'))}")
         print("Recent relevant events:")
         if daily_recap.recent_events:
             for event in daily_recap.recent_events[:5]:
-                print(f"- {event.get('title')} ({event.get('source')})")
+                relevance = event.get("btc_context_relevance", "UNKNOWN")
+                print(f"- {event.get('title')} ({event.get('source')}) relevance={relevance}")
         else:
             print("None")
         print(f"Score: {daily_recap.score}")
@@ -95,6 +96,27 @@ def print_funnel_summary(funnel, discard_counters):
         print(f"Image eligible: {getattr(note, 'image_eligible', False) if note else False}")
         print(f"Published: {'yes' if daily_recap.published else 'no'}")
         print(f"Reason: {daily_recap.reason}")
+        if context:
+            trace = context.trace or {}
+            print()
+            print("DAILY CONTEXT TRACE")
+            for key in [
+                "market_snapshot_24h",
+                "intraday_24h",
+                "resolved_24h",
+                "rolling_1h_peak",
+                "rolling_4h_peak",
+                "rolling_volume_peak",
+                "oi_raw",
+                "oi_context",
+                "structure_raw",
+                "structure_resolved",
+                "events_before_filter",
+                "events_after_filter",
+                "daily_score",
+                "decision",
+            ]:
+                print(f"{key}: {trace.get(key, 'UNKNOWN')}")
         print()
     print("INTAKE / NOVELTY")
     print(format_intake_stats(funnel.get("intake_stats")))

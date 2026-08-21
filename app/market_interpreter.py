@@ -205,7 +205,16 @@ def omitted_data(item, selected):
     available = []
     summary = item.intelligence_summary or {}
     for key in sorted(summary):
-        if summary[key] not in {None, "", "UNKNOWN"}:
+        value = summary[key]
+        if value is None:
+            continue
+        if isinstance(value, str) and value in {"", "UNKNOWN"}:
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        if not isinstance(value, (str, int, float, bool, list, dict)):
+            value = str(value)
+        if value not in {None, "", "UNKNOWN"} if isinstance(value, (str, int, float, bool)) else True:
             available.append(key)
     selected_keys = " ".join(selected)
     return [key for key in available if key not in selected_keys][:10]

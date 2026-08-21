@@ -72,6 +72,10 @@ SYNONYMS = {
 }
 
 
+def _publication_scoped_item(item):
+    return getattr(item, "source", "") == "MARKET_STATE" and getattr(item, "event_type", "") == "BTC_DAILY_RECAP"
+
+
 @dataclass
 class IntakeDecision:
     item: object
@@ -521,12 +525,16 @@ class SeenCache:
                 (canonical,),
             ).fetchone()
             if exact:
+                if _publication_scoped_item(item) and exact["status"] != "PUBLISHED":
+                    return "NEW_EVENT", "SIMULATED_OR_TECHNICAL_SEEN", dict(exact)
                 return "DUPLICATE", "EXACT", dict(exact)
             title = conn.execute(
                 "SELECT * FROM seen_items WHERE title_fingerprint = ?",
                 (tfp,),
             ).fetchone()
             if title:
+                if _publication_scoped_item(item) and title["status"] != "PUBLISHED":
+                    return "NEW_EVENT", "SIMULATED_OR_TECHNICAL_SEEN", dict(title)
                 return "DUPLICATE", "NEAR_DUPLICATE", dict(title)
             event = conn.execute(
                 "SELECT * FROM seen_items WHERE event_fingerprint = ? ORDER BY id DESC LIMIT 1",
@@ -537,6 +545,8 @@ class SeenCache:
                 new_state = _event_state(f"{item.title} {item.summary}")
                 if is_material_update(row.get("event_state"), new_state):
                     return "MATERIAL_UPDATE", "MATERIAL_UPDATE", row
+                if _publication_scoped_item(item) and row.get("status") != "PUBLISHED":
+                    return "NEW_EVENT", "SIMULATED_OR_TECHNICAL_SEEN", row
                 return "SUPPORTING_SOURCE", "SAME_EVENT", row
         return "NEW_EVENT", "NEW_EVENT", None
 
@@ -641,6 +651,11 @@ class SeenCache:
         for item in items:
             self.increment_source(item.source, "published")
             self.update_item_status(item, "PUBLISHED")
+
+    def mark_would_publish(self, items, shadow=False):
+        status = "SHADOW_PUBLISHED" if shadow else "WOULD_PUBLISH"
+        for item in items:
+            self.update_item_status(item, status)
 
     def quiet_market_seen(self, fingerprint):
         with self._connect() as conn:
@@ -815,25 +830,28 @@ class SeenCache:
             ).fetchone()
             if not row:
                 return False, None
-            return row["fingerprint"] == fingerprint, dict(row)
+            if row["fingerprint"] != fingerprint:
+                return False, dict(row)
+            return bool(row["last_published"]), dict(row)
 
-    def remember_daily_recap(self, fingerprint, published=False):
+    def remember_daily_recap(self, fingerprint, published=False, shadow=False):
         now = _utc_now()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM market_state WHERE kind = 'btc_daily_recap'",
             ).fetchone()
             last_published = now if published else (row["last_published"] if row else "")
+            kind = "btc_daily_recap_shadow" if shadow else "btc_daily_recap"
             conn.execute(
                 """
                 INSERT INTO market_state(kind, fingerprint, last_seen, last_published)
-                VALUES ('btc_daily_recap', ?, ?, ?)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(kind) DO UPDATE SET
                     fingerprint=excluded.fingerprint,
                     last_seen=excluded.last_seen,
                     last_published=excluded.last_published
                 """,
-                (fingerprint, now, last_published),
+                (kind, fingerprint, now, last_published),
             )
 
 

@@ -24,6 +24,7 @@ from crypto_market_engine import (
 from combined_story import attach_market_reaction_to_news
 from daily_publication_gate import evaluate_daily_item
 from daily_recap import (
+    build_daily_market_context,
     daily_market_state_score,
     evaluate_daily_market_recap,
     replay_seen_events_with_current_rules,
@@ -2853,24 +2854,120 @@ class MarketIntelligenceTests(unittest.TestCase):
         with patch("daily_recap.recent_history", return_value=[]):
             decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
 
-        self.assertEqual(state.snapshot.price_change_24h, 5.848)
+        self.assertIsNone(state.snapshot.price_change_24h)
+        self.assertEqual(decision.context.change_24h, 5.848)
         if decision.note:
             self.assertEqual(decision.note.intelligence_summary["CURRENT_24H_MOVE"], 5.848)
+
+    def test_daily_context_real_bug_fixture_keeps_market_data_when_intraday_no_action(self):
+        snapshot = intraday_snapshot(
+            change_15m=-0.7266,
+            change_1h=-0.8882,
+            change_4h=-0.8126,
+            volume_ratio=2.1065,
+            volatility_ratio=2.2103,
+            oi_change=-0.309,
+            structure_15m="RANGE",
+            structure_1h="BULLISH",
+            structure_4h="BULLISH",
+        )
+        snapshot.price_change_24h = 6.2272
+        snapshot.oi_change_1h = -0.309
+        snapshot.oi_change_4h = -0.9565
+        snapshot.max_abs_move_15m_24h = 1.4
+        snapshot.max_abs_move_1h_24h = 2.2
+        snapshot.max_abs_move_4h_24h = 3.4
+        snapshot.peak_volume_ratio_24h = 2.6
+        snapshot.peak_volatility_ratio_24h = 2.4
+        state = analyze_btc_intraday_state(snapshot)
+        state.decision = "NO_ACTION"
+        market_state = BtcMarketState(
+            snapshot=BtcMarketSnapshot(price=77007.9, price_change_24h=6.31, open_interest=8_200_000_000),
+            intraday=state,
+        )
+
+        context = build_daily_market_context(market_state, seen_cache=temp_seen_cache())
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        self.assertEqual(state.decision, "NO_ACTION")
+        self.assertIsNotNone(context.change_24h)
+        self.assertEqual(context.change_24h, 6.2272)
+        self.assertNotEqual(context.oi_daily_context, "UNKNOWN")
+        self.assertEqual(context.structure_1h, "BULLISH")
+        self.assertEqual(context.structure_4h, "BULLISH")
+        self.assertEqual(context.max_abs_move_1h_24h, 2.2)
+        self.assertEqual(context.peak_volume_ratio_24h, 2.6)
+        self.assertEqual(decision.context.change_24h, 6.2272)
+        self.assertNotEqual(decision.context.oi_daily_context, "UNKNOWN")
+        self.assertNotEqual(decision.context.structure_4h, "UNKNOWN")
+        self.assertIn(decision.reason, {"PASS", "LOW_DAILY_MARKET_STATE_SCORE", "RECENT_BTC_POST_ALREADY_COVERED"})
+
+    def test_daily_e2e_rejects_or_publishes_with_real_score_not_unknown_plumbing(self):
+        snapshot = intraday_snapshot(
+            change_15m=-0.7266,
+            change_1h=-0.8882,
+            change_4h=-0.8126,
+            volume_ratio=2.1065,
+            volatility_ratio=2.2103,
+            oi_change=-0.309,
+            structure_15m="RANGE",
+            structure_1h="BULLISH",
+            structure_4h="BULLISH",
+        )
+        snapshot.price_change_24h = 6.2272
+        snapshot.oi_change_1h = -0.309
+        snapshot.oi_change_4h = -0.9565
+        snapshot.max_abs_move_1h_24h = 2.2
+        snapshot.max_abs_move_4h_24h = 3.4
+        snapshot.peak_volume_ratio_24h = 2.6
+        snapshot.peak_volatility_ratio_24h = 2.4
+        market_state = BtcMarketState(
+            snapshot=BtcMarketSnapshot(price=77007.9, price_change_24h=6.31),
+            intraday=analyze_btc_intraday_state(snapshot),
+        )
+        market_state.intraday.decision = "NO_ACTION"
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            decision = evaluate_daily_market_recap(market_state, seen_cache=temp_seen_cache())
+
+        if decision.eligible:
+            note = decision.note
+            interpretation = build_editorial_interpretation(note)
+            gate = evaluate_daily_item(note)
+            final_result = "WOULD_PUBLISH" if gate.passed else "REJECTED"
+            self.assertEqual(final_result, "WOULD_PUBLISH")
+            self.assertRegex(interpretation["headline"], r"BTC|BITCOIN")
+        else:
+            final_result = "REJECTED"
+            self.assertGreater(decision.score, 0)
+            self.assertNotEqual(decision.context.change_24h, "UNKNOWN")
+            self.assertIn(decision.reason, {"LOW_DAILY_MARKET_STATE_SCORE", "RECENT_BTC_POST_ALREADY_COVERED"})
+        self.assertEqual(final_result, "REJECTED" if not decision.eligible else "WOULD_PUBLISH")
 
     def test_irrelevant_recent_events_excluded_from_btc_recap(self):
         cache = temp_seen_cache()
         cache.remember_item(item("Djibouti football federation elects new chairman", source="BBC World"), "DISCARDED")
         cache.remember_item(item("Social Security union criticizes staffing decision", source="TechCrunch"), "DISCARDED")
         cache.remember_item(item("Solana slot time improves after validator patch", source="Cointelegraph"), "DISCARDED")
+        cache.remember_item(item("Kalshi traders think Bitcoin rally could end near current levels", source="CNBC"), "DISCARDED")
+        cache.remember_item(item("Coldcard ships firmware after Bitcoin self custody theft", source="CoinDesk"), "DISCARDED")
         cache.remember_item(item("Trump comments on Bitcoin regulation and CLARITY Act", source="CNBC"), "DISCARDED")
 
         events = cache.get_recent_relevant_events(hours=24)
+        state = analyze_btc_intraday_state(intraday_snapshot(change_1h=0.1, change_4h=0.2))
+        state.snapshot.price_change_24h = 6.0
+        decision = evaluate_daily_market_recap(BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state), seen_cache=cache)
 
         titles = " ".join(event["title"] for event in events)
+        filtered_titles = " ".join(event["title"] for event in decision.recent_events)
         self.assertIn("trump", titles)
         self.assertNotIn("djibouti", titles)
         self.assertNotIn("social security", titles)
         self.assertNotIn("solana", titles)
+        self.assertIn("trump", filtered_titles)
+        self.assertNotIn("kalshi", filtered_titles)
+        self.assertNotIn("coldcard", filtered_titles)
 
     def test_btc_today_rolling_memory_preserves_peak_move(self):
         cache = temp_seen_cache()
@@ -2907,6 +3004,94 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertTrue(first.eligible)
         self.assertFalse(second.eligible)
         self.assertEqual(second.reason, "DUPLICATE_DAILY_RECAP")
+
+    def test_dry_run_daily_recap_does_not_consume_live_publication_state(self):
+        cache = temp_seen_cache()
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.2, change_4h=3.5, volume_ratio=3.0, volatility_ratio=2.4, oi_change=-1.0)
+        )
+        state.snapshot.price_change_24h = 6.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            dry = evaluate_daily_market_recap(market_state, seen_cache=cache)
+            cache.mark_would_publish([dry.note], shadow=False)
+            cache.remember_daily_recap(dry.fingerprint, published=False)
+            live = evaluate_daily_market_recap(market_state, seen_cache=cache)
+
+        self.assertTrue(dry.eligible)
+        self.assertTrue(live.eligible)
+        self.assertEqual(live.reason, "PASS")
+
+    def test_shadow_daily_recap_does_not_consume_live_publication_state(self):
+        cache = temp_seen_cache()
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.2, change_4h=3.5, volume_ratio=3.0, volatility_ratio=2.4, oi_change=-1.0)
+        )
+        state.snapshot.price_change_24h = 6.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            shadow = evaluate_daily_market_recap(market_state, seen_cache=cache)
+            cache.mark_would_publish([shadow.note], shadow=True)
+            cache.remember_daily_recap(shadow.fingerprint, published=False, shadow=True)
+            live = evaluate_daily_market_recap(market_state, seen_cache=cache)
+
+        self.assertTrue(shadow.eligible)
+        self.assertTrue(live.eligible)
+        self.assertEqual(live.reason, "PASS")
+
+    def test_live_published_daily_recap_blocks_duplicate(self):
+        cache = temp_seen_cache()
+        state = analyze_btc_intraday_state(
+            intraday_snapshot(change_1h=2.2, change_4h=3.5, volume_ratio=3.0, volatility_ratio=2.4, oi_change=-1.0)
+        )
+        state.snapshot.price_change_24h = 6.5
+        market_state = BtcMarketState(snapshot=BtcMarketSnapshot(price=100000), intraday=state)
+
+        with patch("daily_recap.recent_history", return_value=[]):
+            first = evaluate_daily_market_recap(market_state, seen_cache=cache)
+            cache.mark_published([first.note])
+            cache.remember_daily_recap(first.fingerprint, published=True)
+            second = evaluate_daily_market_recap(market_state, seen_cache=cache)
+
+        self.assertTrue(first.eligible)
+        self.assertFalse(second.eligible)
+        self.assertEqual(second.reason, "DUPLICATE_DAILY_RECAP")
+
+    def test_same_real_event_is_blocked_after_live_published_status(self):
+        cache = temp_seen_cache()
+        first = item("BTC today: daily rally with bullish 4h structure", source="MARKET_STATE")
+        first.event_type = "BTC_DAILY_RECAP"
+        first.link = "market-state:btc-daily-recap:abc"
+        first.summary = "BTC daily recap"
+        second = item("BTC today: daily rally with bullish 4h structure", source="MARKET_STATE")
+        second.event_type = "BTC_DAILY_RECAP"
+        second.link = "market-state:btc-daily-recap:abc"
+        second.summary = "BTC daily recap"
+
+        accepted_first, _ = cache.filter_new_items([first])
+        cache.mark_published(accepted_first)
+        accepted_second, stats = cache.filter_new_items([second])
+
+        self.assertEqual(len(accepted_first), 1)
+        self.assertEqual(accepted_second, [])
+        self.assertEqual(stats.exact_duplicates, 1)
+
+    def test_material_update_allowed_after_live_published_event(self):
+        cache = temp_seen_cache()
+        rumor = item("Trump Bitcoin reserve rumor circulates", source="Telegram")
+        rumor.summary = "Rumor says Trump may announce Bitcoin reserve."
+        confirmed = item("Trump confirms Bitcoin reserve proposal", source="Truth Social")
+        confirmed.summary = "Trump confirms Bitcoin reserve proposal."
+
+        accepted_first, _ = cache.filter_new_items([rumor])
+        cache.mark_published(accepted_first)
+        accepted_second, stats = cache.filter_new_items([confirmed])
+
+        self.assertEqual(len(accepted_first), 1)
+        self.assertEqual(len(accepted_second), 1)
+        self.assertEqual(stats.material_updates, 1)
 
     def test_btc_today_intraday_alert_already_covered_suppresses_recap(self):
         state = analyze_btc_intraday_state(

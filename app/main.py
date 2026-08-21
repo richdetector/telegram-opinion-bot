@@ -674,6 +674,13 @@ async def process_news():
     funnel["would_publish"] = len(mensajes)
 
     if DRY_RUN or AUTO_PUBLISH_SHADOW:
+        seen_cache.mark_would_publish(noticias, shadow=AUTO_PUBLISH_SHADOW)
+        if any(item.event_type == "BTC_DAILY_RECAP" for item in noticias) and daily_recap_decision:
+            seen_cache.remember_daily_recap(
+                daily_recap_decision.fingerprint,
+                published=False,
+                shadow=AUTO_PUBLISH_SHADOW,
+            )
         print_funnel_summary(funnel, discard_counters)
         print_final_decision_gate(final_gate_results)
         print_btc_market_state(btc_market_state)
